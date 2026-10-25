@@ -1,3 +1,4 @@
+from dataflex.train.data.metadata import split_batch
 from dataflex.core.registry import register_selector
 from dataflex.utils.selector_io import load_cached_selection, save_selection
 from .base_selector import Selector
@@ -118,7 +119,7 @@ class LessSelector(Selector):
         # 必须先对当前 batch 做 forward + backward，才能产生对应的梯度
         if self.accelerator.state.deepspeed_plugin is not None:
             # DeepSpeed 模式：直接调用 model forward/backward
-            loss = model(**batch).loss
+            loss = model(**split_batch(batch)[0]).loss
             model.backward(loss)
             # 使用 safe_get_full_grad 获取完整梯度（ZeRO 分区下需要 gather）
             from deepspeed.utils import safe_get_full_grad
@@ -132,7 +133,7 @@ class LessSelector(Selector):
         else:
             # 非 DeepSpeed 模式
             with self.accelerator.no_sync(model):
-                loss = model(**batch).loss
+                loss = model(**split_batch(batch)[0]).loss
                 self.accelerator.backward(loss)
             vectorized_grads = torch.cat(
                 [p.grad.view(-1) for p in model.parameters() if p.grad is not None]

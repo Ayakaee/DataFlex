@@ -21,6 +21,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
+from dataflex.train.data.metadata import split_batch
 from dataflex.core.registry import register_weighter
 from dataflex.utils.logging import logger
 from .base_weighter import Weighter
@@ -196,7 +197,8 @@ class MultimodalDeltalossWeighter(Weighter):
     # ---- 前向 ----
 
     def _forward_loss(self, model, batch):
-        inputs = {k: v for k, v in batch.items() if k != "labels"}
+        inputs, _ = split_batch(batch)
+        inputs.pop("labels", None)
         logits = model(**inputs, use_cache=False).logits
         return self._answer_loss(logits, batch["labels"])
 

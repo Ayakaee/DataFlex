@@ -23,6 +23,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM
 
+from dataflex.train.data.metadata import split_batch
 from dataflex.utils.logging import logger
 from .base_selector import Selector
 
@@ -199,7 +200,7 @@ class ClusterBaseSelector(Selector):
             for indices, batch in tqdm(loader, desc="[ClusterBase] embeddings",
                                        disable=not self.accelerator.is_local_main_process):
                 batch = _move_to_device(batch, self.device)
-                hidden = emb_model(**batch, output_hidden_states=True).hidden_states[self.embedding_layer]
+                hidden = emb_model(**split_batch(batch)[0], output_hidden_states=True).hidden_states[self.embedding_layer]
                 mask = batch.get("attention_mask")
                 if mask is not None:
                     mask = mask.unsqueeze(-1).float()
@@ -283,7 +284,7 @@ class ClusterBaseSelector(Selector):
             batch = _move_to_device(batch, self.device)
             model.zero_grad()
             with self.accelerator.no_sync(model):
-                model(**batch).loss.backward()
+                model(**split_batch(batch)[0]).loss.backward()
             # 拼接目标层的梯度
             grad_parts = []
             for _, module in target_layers:

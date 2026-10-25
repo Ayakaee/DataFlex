@@ -1,3 +1,4 @@
+from dataflex.train.data.metadata import split_batch
 from dataflex.core.registry import register_selector
 from dataflex.utils.selector_io import load_cached_selection, save_selection
 from dataflex.utils.logging import logger
@@ -96,7 +97,7 @@ class LossSelector(Selector):
             idx = idx.view(-1).to(dtype=torch.long)
 
             with torch.no_grad():
-                model_inputs = {k: v for k, v in batch.items() if k not in ("idx", "domain_id")}
+                model_inputs, _ = split_batch(batch)
                 outputs = model(**model_inputs)
                 loss = per_sample_loss_from_outputs(outputs, model_inputs).view(-1)
 

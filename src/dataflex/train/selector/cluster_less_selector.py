@@ -18,6 +18,7 @@ from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from dataflex.core.registry import register_selector
+from dataflex.train.data.metadata import split_batch
 from dataflex.utils.logging import logger
 from dataflex.utils.selector_io import load_cached_selection, save_selection
 
@@ -216,7 +217,7 @@ class ClusterLessSelector(ClusterBaseSelector):
             model.zero_grad()
             # no_sync：避免 DDP 把各卡梯度平均，保证是单样本梯度
             with self.accelerator.no_sync(model):
-                model(**batch).loss.backward()
+                model(**split_batch(batch)[0]).loss.backward()
 
             # 拼接所有 requires_grad 参数的梯度
             grad_flat = torch.cat([

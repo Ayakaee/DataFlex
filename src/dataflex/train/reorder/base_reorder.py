@@ -5,6 +5,7 @@ from dataflex.utils.logging import logger
 
 from .patterns import PATTERNS, apply_pattern
 
+
 #: Which end of the raw score the curriculum should finish on.
 #:
 #: Every pattern arranges samples along one axis that advances as training
@@ -78,6 +79,13 @@ class Reorder(ABC):
         self._candidate_pool: Optional[List[int]] = None
         self._domain_ids: Optional[Sequence[int]] = None
         self._signals: Dict[str, Any] = {}
+
+    def set_data_collator(self, data_collator) -> None:
+        """Update even an already-created dynamic score provider."""
+        self.data_collator = data_collator
+        provider = getattr(self, "_provider", None)
+        if provider is not None and hasattr(provider, "data_collator"):
+            provider.data_collator = data_collator
 
     # ------------------------------------------------------------------
     # Composition hooks

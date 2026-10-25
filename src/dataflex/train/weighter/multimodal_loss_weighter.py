@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
+from dataflex.train.data.metadata import split_batch
 from dataflex.core.registry import register_weighter
 from dataflex.utils.logging import logger
 from .base_weighter import Weighter
@@ -133,7 +134,8 @@ class MultimodalLossWeighter(Weighter):
         idx_l, key_l, loss_l = [], [], []
         for batch in loader:
             main = batch["main"]
-            inputs = {k: v for k, v in main.items() if k != "labels"}
+            inputs, _ = split_batch(main)
+            inputs.pop("labels", None)
             logits = model(**inputs, use_cache=False).logits
             # per-sample answer-token-mean CE
             shift_logits, shift_labels = logits[:, :-1], main["labels"][:, 1:]

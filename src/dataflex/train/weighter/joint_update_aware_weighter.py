@@ -7,6 +7,7 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from dataflex.core.registry import register_weighter
+from dataflex.train.data.metadata import split_batch
 from dataflex.utils.logging import logger
 
 from .base_weighter import Weighter
@@ -157,7 +158,7 @@ class JointUpdateAwareWeighter(Weighter):
         try:
             with torch.no_grad():
                 outputs = model(
-                    **{k: v for k, v in batch.items() if k != "labels"},
+                    **{k: v for k, v in split_batch(batch)[0].items() if k != "labels"},
                     labels=batch.get("labels"),
                     output_hidden_states=True,
                 )
@@ -236,7 +237,7 @@ class JointUpdateAwareWeighter(Weighter):
 
         with torch.no_grad():
             outputs = model(
-                **{k: v for k, v in batch.items() if k != "labels"},
+                **{k: v for k, v in split_batch(batch)[0].items() if k != "labels"},
                 labels=batch.get("labels"),
                 output_hidden_states=True,
             )

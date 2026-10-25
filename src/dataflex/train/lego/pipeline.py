@@ -224,6 +224,18 @@ class SchedulePipeline:
         loss_part = " x ".join(s.describe() for s in self.loss_stages) or "(none)"
         return f"index[{index_part}] loss[{loss_part}]"
 
+    def set_data_collator(self, data_collator) -> None:
+        """Use the Trainer's resolved collator for every scoring path as well."""
+        if self.scoreboard is not None:
+            self.scoreboard.data_collator = data_collator
+        for stage in (*self.index_stages, *self.loss_stages):
+            component = stage.component
+            setter = getattr(component, "set_data_collator", None)
+            if callable(setter):
+                setter(data_collator)
+            elif hasattr(component, "data_collator"):
+                component.data_collator = data_collator
+
     @property
     def has_reorder(self) -> bool:
         return any(isinstance(s, ReorderStage) for s in self.index_stages)

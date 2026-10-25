@@ -8,6 +8,7 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from dataflex.core.registry import register_selector
+from dataflex.train.data.metadata import split_batch
 from dataflex.utils.logging import logger
 from dataflex.utils.selector_io import load_cached_selection, save_selection
 
@@ -239,7 +240,7 @@ class IconsSelector(Selector):
         batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
         if zero3:
-            loss = model(**batch).loss
+            loss = model(**split_batch(batch)[0]).loss
             model.backward(loss)
             from deepspeed.utils import safe_get_local_grad
             grads = []
@@ -251,7 +252,7 @@ class IconsSelector(Selector):
             vectorized_grads = torch.cat(grads) if grads else None
         else:
             with self.accelerator.no_sync(model):
-                loss = model(**batch).loss
+                loss = model(**split_batch(batch)[0]).loss
                 self.accelerator.backward(loss)
             grads_list = [p.grad.view(-1) for p in model.parameters() if p.grad is not None]
             vectorized_grads = torch.cat(grads_list) if grads_list else None

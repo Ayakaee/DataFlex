@@ -22,6 +22,7 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
+from dataflex.train.data.metadata import split_batch
 from dataflex.utils.logging import logger
 from dataflex.utils.loss_utils import per_sample_loss_from_outputs
 
@@ -243,7 +244,7 @@ class ScoreBoard:
                 idx = torch.tensor(idx, dtype=torch.long, device=self.accelerator.device)
             idx = idx.view(-1).to(dtype=torch.long)
 
-            inputs = {k: v for k, v in batch.items() if k not in ("idx", "domain_id")}
+            inputs, _ = split_batch(batch)
             with torch.no_grad():
                 outputs = model(**inputs)
                 per_sample = per_sample_loss_from_outputs(outputs, inputs)

@@ -4,6 +4,7 @@ import numpy as np
 import torch
 from typing_extensions import override
 
+from dataflex.train.data.metadata import SAMPLE_METADATA_KEYS, MetadataCollator, split_batch
 from dataflex.train.hooks import group_by_length_requested
 from dataflex.train.lego import PlanContext, SchedulePipeline, ScoreBoard
 from dataflex.train.lego.domain_view import DomainView
@@ -25,7 +26,16 @@ class _PipelineAsSelector:
 
     def __init__(self, trainer: "LegoTrainer"):
         self.trainer = trainer
-        self.data_collator = None  # assigned by get_train_dataloader
+        self._data_collator = trainer.data_collator
+
+    @property
+    def data_collator(self):
+        return self._data_collator
+
+    @data_collator.setter
+    def data_collator(self, value):
+        self._data_collator = value
+        self.trainer.pipeline.set_data_collator(value)
 
     def warmup(self, num_samples: int, replacement: bool = False) -> List[int]:
         ctx = self.trainer.plan_context(num_samples=num_samples, step_id=0)
@@ -70,6 +80,7 @@ class LegoTrainer(SelectTrainer):
         self.domain_names = list(domain_names) if domain_names else None
         self._active_plan = None
         self._last_signals = {}
+        self.data_collator = MetadataCollator(self.data_collator)
 
         name = finetuning_args.component_name
         cfg = load_component("pipelines", finetuning_args.components_cfg_file, name, runtime_vars={})
@@ -138,14 +149,11 @@ class LegoTrainer(SelectTrainer):
     # ------------------------------------------------------------------
 
     def plan_context(self, num_samples: int, step_id: int, model=None, **kwargs) -> PlanContext:
-        return PlanContext(
-            dataset=self.train_dataset,
-            dataset_size=len(self.train_dataset) if self.train_dataset is not None else 0,
-            domain_ids=self.domain_ids,
-            domain_names=self.domain_names,
-            model=model if model is not None else self.model,
-            accelerator=self.accelerator,
-            data_collator=self.data_collator,
+        return PlanContext.from_trainer(
+            self,
+            model=model,
+            data_collator=self.selector.data_collator,
+            tokenizer=kwargs.get("tokenizer", self.processing_class),
             step_id=step_id,
             interval_size=num_samples,
             current_update_times=kwargs.get("current_update_times", 1),
@@ -160,6 +168,20 @@ class LegoTrainer(SelectTrainer):
     # ------------------------------------------------------------------
     # Index space
     # ------------------------------------------------------------------
+
+    def _set_signature_columns_if_needed(self):
+        super()._set_signature_columns_if_needed()
+        # These are consumed by the collator, before model.forward. Extending
+        # the signature covers both HF Dataset pruning and RemoveColumnsCollator.
+        self._signature_columns = list(dict.fromkeys([
+            *self._signature_columns, *SAMPLE_METADATA_KEYS, "images", "videos", "audios",
+        ]))
+
+    def _get_collator_with_removed_columns(self, data_collator, description=None):
+        if isinstance(data_collator, MetadataCollator):
+            data_collator = data_collator.collator
+        collator = super()._get_collator_with_removed_columns(data_collator, description=description)
+        return MetadataCollator(collator)
 
     @override
     def _get_train_sampler(self, train_dataset=None) -> Optional[torch.utils.data.Sampler]:
@@ -192,22 +214,20 @@ class LegoTrainer(SelectTrainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         """Apply the loss-space stack.
 
-        `domain_id` is injected by the dataset wrapper but is not a model input,
-        so it is stripped before the forward pass and kept for the weight stages.
+        Scheduling metadata is kept for weight stages, outside model.forward.
         """
         if not self.pipeline.has_loss_stages(self.state.global_step):
-            return self._forward_without_domain_id(
+            return self._forward_without_metadata(
                 model, inputs, return_outputs=return_outputs, num_items_in_batch=num_items_in_batch
             )
 
-        domain_id = inputs.get("domain_id")
-        model_inputs = {k: v for k, v in inputs.items() if k != "domain_id"}
+        model_inputs, metadata = split_batch(inputs)
         labels = model_inputs.get("labels")
 
         outputs = model(**model_inputs)
         if labels is None or getattr(outputs, "logits", None) is None:
             logger.warning("[Dataflex][Lego] cannot form per-sample losses; using the model's scalar loss")
-            return self._forward_without_domain_id(
+            return self._forward_without_metadata(
                 model, inputs, return_outputs=return_outputs, num_items_in_batch=num_items_in_batch
             )
 
@@ -221,9 +241,7 @@ class LegoTrainer(SelectTrainer):
             model=model,
             batch=inputs,
         )
-        weight_inputs = dict(model_inputs)
-        if domain_id is not None:
-            weight_inputs["domain_id"] = domain_id
+        weight_inputs = {**model_inputs, **metadata}
 
         loss = self.pipeline.weighted_loss(per_sample, ctx, model=model, inputs=weight_inputs)
         if loss is None:
@@ -231,8 +249,8 @@ class LegoTrainer(SelectTrainer):
 
         return (loss, outputs) if return_outputs else loss
 
-    def _forward_without_domain_id(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        model_inputs = {k: v for k, v in inputs.items() if k != "domain_id"}
+    def _forward_without_metadata(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        model_inputs, _ = split_batch(inputs)
         return super().compute_loss(
             model, model_inputs, return_outputs=return_outputs, num_items_in_batch=num_items_in_batch
         )
@@ -300,7 +318,7 @@ class LegoTrainer(SelectTrainer):
             return
         if not torch.is_tensor(domain_id):
             domain_id = torch.as_tensor(domain_id, dtype=torch.long)
-        batch = {k: v for k, v in inputs.items() if k != "domain_id"}
+        batch, _ = split_batch(inputs)
         for stage in stages:
             stage.update_from_batch(model, self.state.global_step, batch, domain_id.view(-1))
 

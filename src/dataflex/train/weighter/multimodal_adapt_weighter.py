@@ -17,6 +17,7 @@ import torch.distributed as dist
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
+from dataflex.train.data.metadata import split_batch
 from dataflex.core.registry import register_weighter
 from dataflex.utils.logging import logger
 from .base_weighter import Weighter
@@ -95,7 +96,8 @@ class MultimodalAdaptWeighter(Weighter):
         整条 batch（含 pixel_values）喂给模型，多模态键自动带上。
         位置权重线性递增（1, 2, 3, ...），越靠后权重越大。
         """
-        model_inputs = {k: v for k, v in batch.items() if k not in ("labels", "idx")}
+        model_inputs, _ = split_batch(batch)
+        model_inputs.pop("labels", None)
         hidden = model(**model_inputs, output_hidden_states=True, use_cache=False).hidden_states[-1]
         keep = self._pool_mask(batch)[:, :hidden.size(1)].to(hidden.dtype)
         pos = torch.arange(1, hidden.size(1) + 1, device=hidden.device, dtype=hidden.dtype) * keep

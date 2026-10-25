@@ -19,6 +19,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from dataflex.core.registry import register_selector
+from dataflex.train.data.metadata import split_batch
 from dataflex.utils.logging import logger
 from dataflex.utils.selector_io import load_cached_selection, save_selection
 
@@ -177,7 +178,7 @@ class TracInSelector(ClusterBaseSelector):
             batch = _move_to_device(batch, self.device)
             model.zero_grad()
             with self.accelerator.no_sync(model):
-                model(**batch).loss.backward()
+                model(**split_batch(batch)[0]).loss.backward()
             grad_flat = torch.cat([(p.grad if p.grad is not None else torch.zeros_like(p)).detach().float().view(-1)
                                    for p in model.parameters() if p.requires_grad])
             grads_buf.append(projector.project(grad_flat.unsqueeze(0).to(proj_device), model_id=0).squeeze(0).cpu())

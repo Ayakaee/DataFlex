@@ -18,6 +18,7 @@ from transformers.integrations.deepspeed import (
 )
 
 from dataflex.core.registry import register_selector
+from dataflex.train.data.metadata import split_batch
 from dataflex.utils.logging import logger
 from dataflex.utils.selector_io import load_cached_selection, save_selection
 
@@ -336,7 +337,8 @@ class CoincideSelector(Selector):
             ):
                 batch = _move_to_device(batch, self.device)
                 # Selection only needs hidden states.
-                model_inputs = {k: v for k, v in batch.items() if k != "labels"}
+                model_inputs, _ = split_batch(batch)
+                model_inputs.pop("labels", None)
                 outputs = emb_model(**model_inputs, **forward_kwargs)
                 pooled = self._pool_multimodal_features(
                     outputs.hidden_states,

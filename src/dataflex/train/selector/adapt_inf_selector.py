@@ -47,6 +47,7 @@ import torch.distributed as dist
 from tqdm import tqdm
 
 from dataflex.core.registry import register_selector
+from dataflex.train.data.metadata import split_batch
 from dataflex.utils.multimodal_scoring import (
     answer_statistics,
     move_to_device,
@@ -272,7 +273,7 @@ class AdaptInfSelector(Selector):
                     if not sample.get("images") or sample.get("videos") or sample.get("audios"):
                         raise ValueError("Author IG requires image-only training records")
                     batch = move_to_device(self.data_collator([dict(sample)]), self.accelerator.device)
-                    batch.pop("__record_indices__", None)
+                    batch, _ = split_batch(batch)
                     batch["use_cache"] = False
                     with self.accelerator.autocast(), torch.enable_grad():
                         # We compute answer-only CE ourselves. Passing labels

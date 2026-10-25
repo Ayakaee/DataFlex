@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, List, Literal, Optional, Union
 
 import numpy as np
 from datasets import Dataset, DatasetDict, concatenate_datasets, load_dataset, load_from_disk
-from torch.utils.data import Dataset as TorchDataset
 
 from llamafactory.extras.constants import FILEEXT2TYPE
 from llamafactory.extras.misc import check_version, has_tokenized_data
@@ -22,6 +21,8 @@ from llamafactory.data.processor import (
     UnsupervisedDatasetProcessor,
 )
 from llamafactory.data.loader import _get_merged_dataset, _get_preprocessed_dataset
+
+from .metadata import DomainLabeledDataset
 
 if TYPE_CHECKING:
     from datasets import Dataset, IterableDataset
@@ -496,43 +497,6 @@ def make_reorder_get_dataset(reorder_factory):
 # ======================================================================
 
 
-class DomainLabeledDataset(TorchDataset):
-    """A single dataset that still knows which domain each row came from.
-
-    The mixture path represents a domain as its own dataset object, which forces
-    `train_dataset = None` and leaves selectors and reorders with nothing to
-    index into. Composition needs the opposite arrangement: one concatenated
-    dataset plus a label per row, so that "allocate a quota per domain" is index
-    arithmetic over groups and every other family keeps working unchanged.
-
-    `domain_id` is injected per item because DoReMi reads it in `compute_loss`
-    and ODM reads it to attribute its bandit reward.
-    """
-
-    def __init__(self, dataset, domain_ids):
-        self.dataset = dataset
-        self.domain_ids = np.asarray(domain_ids, dtype=np.int64)
-        if len(self.domain_ids) != len(dataset):
-            raise ValueError(
-                f"domain_ids has {len(self.domain_ids)} entries but the dataset has {len(dataset)} rows"
-            )
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, idx):
-        item = self.dataset[idx]
-        if isinstance(item, dict):
-            return {**item, "domain_id": int(self.domain_ids[idx])}
-        return item
-
-    @property
-    def column_names(self):
-        # Some LlamaFactory paths sniff this to decide whether to prune columns.
-        names = getattr(self.dataset, "column_names", None)
-        return (list(names) + ["domain_id"]) if names else None
-
-
 def lego_get_dataset(
     template: "Template",
     model_args: "ModelArguments",
@@ -620,11 +584,10 @@ def lego_get_dataset(
         f"[Dataflex][Lego] domains in `dataset:` order (name, rows): {plan}; total={sum(sizes)}"
     )
 
-    # Only wrap when there is something to attribute; a single-domain run does
-    # not need the per-item dict copy.
-    if len(domain_names) > 1:
-        dataset_module["train_dataset"] = DomainLabeledDataset(dataset_module["train_dataset"], domain_ids)
-        logger.info_rank0("[Dataflex][Lego] train_dataset wrapped to carry domain_id per sample.")
+    # Assign IDs once in the concatenated, preprocessed index space, including
+    # single-domain runs. Subsequent Subset views must never renumber them.
+    dataset_module["train_dataset"] = DomainLabeledDataset(dataset_module["train_dataset"], domain_ids)
+    logger.info_rank0("[Dataflex][Lego] train_dataset wrapped to carry idx and domain_id per sample.")
 
     dataset_module["domain_ids"] = domain_ids
     dataset_module["domain_names"] = domain_names
