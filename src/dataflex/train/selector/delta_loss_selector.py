@@ -58,6 +58,7 @@ class DeltaLossSelector(Selector):
         self.window_size = window_size
         self.first_time = True
         self.path_to_initial_losses = None
+        self._initial_losses = None
         self.score_batch_size = int(score_batch_size)
         self.score_num_workers = int(score_num_workers)
 
@@ -143,6 +144,21 @@ class DeltaLossSelector(Selector):
             dense[p] = v
         return dense
 
+    def state_dict(self):
+        return {"first_time": self.first_time,
+                "initial_losses": (torch.as_tensor(self._initial_losses).clone()
+                                   if self._initial_losses is not None else None)}
+
+    def load_state_dict(self, state):
+        baseline = state["initial_losses"]
+        if baseline is not None and baseline.shape != (len(self.dataset),):
+            raise ValueError("DeltaLoss baseline does not match the dataset")
+        if not state["first_time"] and baseline is None:
+            raise ValueError("DeltaLoss checkpoint is missing its initial baseline")
+        self.first_time = bool(state["first_time"])
+        self._initial_losses = baseline.cpu().numpy().copy() if baseline is not None else None
+        self.path_to_initial_losses = None  # Resume does not depend on old cache files.
+
     def select(self, model, step_id: int, num_samples: int, **kwargs):
         model.eval()
         os.makedirs(self.cache_dir, exist_ok=True)
@@ -156,9 +172,10 @@ class DeltaLossSelector(Selector):
             self.first_time = False
             self.path_to_initial_losses = save_path
             # Read and broadcast in main
-            if os.path.exists(save_path):
+            if getattr(self, "reuse_selection_cache", True) and os.path.exists(save_path):
                 if self.accelerator.is_main_process:
-                    cached_indices, _ = load_cached_selection(save_path)
+                    cached_indices, metrics = load_cached_selection(save_path)
+                    self._initial_losses = np.asarray(metrics["loss"], dtype=np.float64)
                 else:
                     cached_indices = None
                 cached_indices_list = [cached_indices]
@@ -171,6 +188,7 @@ class DeltaLossSelector(Selector):
 
             logger.info(f"[Dataflex] Calculating initial losses...")
             scores = self._scores_for(positions, model, step_id)
+            self._initial_losses = self._dense_baseline(positions, scores)
 
             if self.accelerator.is_main_process:
                 logger.info(f"[Dataflex] Got initial_losses. Return random warmup selection.")
@@ -200,7 +218,7 @@ class DeltaLossSelector(Selector):
         
         # ========= Subsequent call to select, select samples based on delta_loss =========
         
-        if os.path.exists(save_path):
+        if getattr(self, "reuse_selection_cache", True) and os.path.exists(save_path):
             if self.accelerator.is_main_process:
                 cached_indices, _ = load_cached_selection(save_path)
             else:
@@ -220,8 +238,10 @@ class DeltaLossSelector(Selector):
         if self.accelerator.is_main_process:
             logger.info(f"[Dataflex] Loading initial losses from {self.path_to_initial_losses}")
 
-            _, metrics = load_cached_selection(self.path_to_initial_losses)
-            baseline = np.asarray(metrics["loss"], dtype=np.float64)
+            if self._initial_losses is None:
+                _, metrics = load_cached_selection(self.path_to_initial_losses)
+                self._initial_losses = np.asarray(metrics["loss"], dtype=np.float64)
+            baseline = self._initial_losses.copy()
             # Caches written before the sentinel was unified hold +inf for
             # entries that were never scored, and an infinite loss is not a
             # usable measurement either way. Normalising them here keeps both

@@ -1,43 +1,102 @@
-# LEGO data/interface checks
+# LEGO data and lifecycle checks
 
-Run from the repository root with Python 3.11+ and `torch`, `numpy`,
-`transformers`, `accelerate`, `datasets`, `pyyaml`, and `pytest` installed:
+Run from the repository root with Python 3.11+, the project training dependencies,
+and pytest:
 
 ```bash
-python -m pytest -q tests/test_lego_metadata.py tests/test_lego_data_flow.py
+python -m pytest -q tests
 ```
 
-These CPU tests use synthetic image patches and a tiny differentiable model.
-The data-flow tests execute the real `LegoTrainer`, `SelectTrainer`, pipeline
-and ScoreBoard. They run against both the Transformers `Seq2SeqTrainer`
-backend and, when installed, the actual LlamaFactory backend. The Transformers
-variant skips eager registration of unrelated optional algorithms; the
-LlamaFactory variant imports the normal component registry. They do not
-validate a real VLM processor, a complete training loop, CUDA, DDP or DeepSpeed.
+The tests use synthetic image patches and a tiny differentiable model. Data-flow
+tests exercise both a Transformers backend and the real LlamaFactory backend
+when installed. Lifecycle/training tests require LlamaFactory. No model or image
+download is needed.
 
-The interface established here is:
+For two-process CPU/Gloo scoring and interrupted-training checks:
 
-- `lego_get_dataset` assigns `idx` and `domain_id` after preprocessing and
-  concatenation, including single-domain training. `idx` means a processed row
-  in this dataset; a packed row may contain multiple original records. Subsets,
-  reordering and repeated draws retain that ID. IDs must not be reused across
-  different preprocessing results or a different order of domains.
-- `MetadataCollator` takes scheduling metadata out before invoking the existing
-  modality collator and restores it afterward. The collator must preserve row
-  count and order. Unlabelled evaluation/anchor batches are supported. Mixed
-  batches with partially missing metadata fail explicitly.
-- `split_batch` removes only the reserved metadata keys (`idx`, `domain_id`,
-  `__record_indices__`). Labels and all modality inputs are preserved. Weight
-  stages still receive metadata; model forward calls do not.
-- The resolved training collator is also used by pipeline components, the
-  ScoreBoard and existing reorder score providers. The wrapper preserves
-  tokenizer, processor and template attribute access.
-- `PlanContext.from_trainer` provides `step_id`, `accelerator`, model, dataset
-  and collator to components. It does not replace the Trainer used for backward
-  or optimizer operations. Existing weighter lifecycle/context migration is
-  subsequent work.
+```bash
+CUDA_VISIBLE_DEVICES="" OMP_NUM_THREADS=1 PYTHONPATH=src:tests \
+python -m torch.distributed.run --standalone --nproc_per_node=2 \
+tests/lego_ddp_smoke.py /path/to/scratch-output
+```
 
-This part does not implement multimodal weight refresh under LEGO, replace
-content-hash weight lookup, change ODM feedback, optimize ADAPT forwards, or
-add cross-component sharing controls. A successful test run does not establish
-that the full multimodal LEGO composition is ready to train.
+Use a separate scratch directory for each run. The DDP script normalizes
+`torch.load(map_location=cpu:N)` to `cpu` inside the test, because the current
+Accelerate/PyTorch 2.6 combination otherwise fails to load the optimizer on CPU.
+Production checkpoint loading is not patched.
+
+## Data contract
+
+- `idx` identifies a row in the concatenated, preprocessed training dataset,
+  including single-domain runs. A packed row may represent multiple raw records.
+  Subsets, ordering and repeated draws retain the same ID.
+- `MetadataCollator` removes scheduling metadata before the existing modality
+  collator and restores it afterward. That collator must preserve row count and
+  order. Unlabelled evaluation/anchor batches are valid; partially labelled
+  batches fail explicitly.
+- `split_batch` removes only `idx`, `domain_id`, and `__record_indices__` before
+  model forward calls. Labels and all modality fields are preserved. Weight
+  stages retain access to metadata.
+- Training, pipeline components, ScoreBoard and reorder providers use the
+  resolved collator, including its tokenizer/processor/template attributes.
+
+## Component lifecycle
+
+`LegoTrainer.training_step` calls `pipeline.prepare_loss_stages` before the
+training forward. The base standalone weighter training step calls the same
+`prepare` entry. `PlanContext` supplies the optimizer step, model and accelerator;
+backward and optimizer operations remain with the Trainer.
+
+- Multimodal Loss and DeltaLoss refresh their full-dataset weight table. LEGO
+  indexes it by `W[batch["idx"]]`, without hashing text or flattened image patches.
+  The legacy hash lookup remains for standalone datasets without IDs.
+- Multimodal ADAPT refreshes its anchor embeddings in `prepare`. Current-batch
+  embeddings still use a separate forward. No ADAPT feature-reuse optimization
+  is implemented here.
+- First activation always initializes state. Subsequent refreshes occur when
+  `global_step % refresh_interval == 0`, at most once per optimizer step.
+  Between refreshes, every training batch is weighted. A weight stage's
+  `warmup_step` controls its own activation; trainer-level selection warmup does
+  not implicitly change it. Weight-stage `every` must remain 1.
+- Evaluation uses the ordinary loss and does not refresh component state.
+- Scalar `get_weighted_loss` remains supported. Sample/token reductions and
+  ADAPT's configured normalization retain their existing formulas.
+- The `delta_loss` selector means initial loss minus current loss. Its first
+  invocation establishes a baseline and returns the existing random selection;
+  LEGO requires `update_times >= 2`. The `multimodal_deltaloss` weighter instead
+  means no-image loss minus image-conditioned loss.
+- Loss/DeltaLoss selector step-only JSON files are still written for inspection,
+  but LEGO does not reuse them as a model/run cache. Filter selection requires
+  no replacement and validates the returned IDs and budget.
+
+## Checkpoints and coverage
+
+Each Trainer checkpoint includes `dataflex_selection_rank_<rank>.json` for the
+active sample sequence/batch cursor and `dataflex_lego_rank_<rank>.pt` for:
+
+- pipeline plans, stage outputs and scheduling clocks;
+- DeltaLoss selector's initial baseline;
+- weight tables, ADAPT anchors and refresh clocks;
+- reorder pending queues/cursors and ScoreBoard values/timestamps.
+
+Tensor/primitive-only state is loaded with `weights_only=True`. Resume verifies
+dataset identity, component configuration, preprocessing information, schedule,
+batch/worker settings and checkpoint step. External media identity includes
+path, size and modification time; media and external score sources must remain
+immutable snapshots. Old checkpoints lacking LEGO state are rejected.
+
+Resume covers selectors loss/delta_loss/adapt_inf/random, mixers static/random,
+the existing static/dynamic reorder implementations (including named pattern
+presets), and the three multimodal weighters plus legacy loss. ODM algorithms
+and feedback are unchanged; checkpoints containing ODM are explicitly rejected
+on resume because its internal state is outside this change.
+
+Tests cover ID alignment, refresh guards, scalar loss/gradient behavior,
+standalone weighting, gradient accumulation, warmup/evaluation, and continuous
+versus interrupted training at both interval boundaries and mid-interval. The
+Adapt-inf test covers the LEGO adapter boundary; its gradient projection and
+image-IG algorithm are not reimplemented or fully exercised by these fixtures.
+
+These tests do not validate real VLM processors, CUDA, ZeRO/FSDP, benchmark
+quality or GPU-hours. Cross-component sharing controls and efficiency metrics
+remain subsequent work.

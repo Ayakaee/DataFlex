@@ -1,15 +1,21 @@
+import json
+from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
 import torch
+from transformers.trainer_utils import get_last_checkpoint
 from typing_extensions import override
 
 from dataflex.train.data.metadata import SAMPLE_METADATA_KEYS, MetadataCollator, split_batch
 from dataflex.train.hooks import group_by_length_requested
 from dataflex.train.lego import PlanContext, SchedulePipeline, ScoreBoard
+from dataflex.train.lego.checkpoint import dataset_identity, pipeline_state, restore_pipeline, save_atomic
 from dataflex.train.lego.domain_view import DomainView
+from dataflex.train.weighter.lifecycle import scoring_mode
 from dataflex.utils.load_component import load_component
 from dataflex.utils.logging import logger
+from dataflex.utils.multimodal_selection import fingerprint
 
 from .select_trainer import SelectTrainer
 
@@ -24,6 +30,8 @@ class _PipelineAsSelector:
     codebase gaining a fifth ~550-line copy of it.
     """
 
+    checkpoint_stage = True
+
     def __init__(self, trainer: "LegoTrainer"):
         self.trainer = trainer
         self._data_collator = trainer.data_collator
@@ -37,6 +45,16 @@ class _PipelineAsSelector:
         self._data_collator = value
         self.trainer.pipeline.set_data_collator(value)
 
+    def checkpoint_signature(self):
+        return self.trainer.lego_checkpoint_signature()
+
+    def export_checkpoint_state(self, **kwargs):
+        return {"version": 1}
+
+    def restore_checkpoint_state(self, state, *, global_step, **kwargs):
+        if state != {"version": 1} or getattr(self.trainer, "_lego_restored_step", None) != global_step:
+            raise ValueError("The selection cursor is missing its matching LEGO checkpoint")
+
     def warmup(self, num_samples: int, replacement: bool = False) -> List[int]:
         ctx = self.trainer.plan_context(num_samples=num_samples, step_id=0)
         return self.trainer.pipeline.warmup_plan(ctx)
@@ -48,7 +66,8 @@ class _PipelineAsSelector:
             model=model,
             **kwargs,
         )
-        plan = self.trainer.pipeline.build_plan(ctx)
+        with scoring_mode(model):
+            plan = self.trainer.pipeline.build_plan(ctx)
         self.trainer._active_plan = plan
         return plan.as_list()
 
@@ -90,6 +109,11 @@ class LegoTrainer(SelectTrainer):
                 f"pipeline '{name}' has no `stages`. A pipeline is a list of "
                 f"{{family, component}} entries under `params.stages`."
             )
+        self._lego_config = {"pipeline": cfg, "components": [
+            load_component(f"{entry['family']}s", finetuning_args.components_cfg_file, entry["component"], {})
+            for entry in stages_cfg if entry.get("enabled", True)
+        ]}
+        self._lego_signature = None
 
         self.scoreboard = ScoreBoard(
             dataset=self.train_dataset,
@@ -130,7 +154,7 @@ class LegoTrainer(SelectTrainer):
             runtime=runtime,
             scoreboard=self.scoreboard,
             save_plans=bool(cfg.get("save_plans", False)),
-            cache_dir=cfg.get("cache_dir"),
+            cache_dir=cfg.get("cache_dir") or str(Path(self.args.output_dir) / "lego_cache"),
         )
 
         # The loop drives `self.selector`; the adapter routes it to the pipeline
@@ -168,6 +192,42 @@ class LegoTrainer(SelectTrainer):
     # ------------------------------------------------------------------
     # Index space
     # ------------------------------------------------------------------
+
+    def dataflex_initial_indices(self):
+        # LEGO can cycle a small pool; standalone SelectTrainer's no-replacement
+        # size restriction does not describe the pipeline's budget contract.
+        count = self._warmup_samples or self._total_train_batch_size * self.finetuning_args.update_step
+        return self.selector.warmup(count, replacement=True)
+
+    def lego_checkpoint_signature(self):
+        if self._lego_signature is None:
+            def semantic(value):
+                if isinstance(value, dict):
+                    return {key: semantic(item) for key, item in value.items()
+                            if key not in {"cache_dir", "output_dir", "save_plans"}}
+                if isinstance(value, (list, tuple)):
+                    return [semantic(item) for item in value]
+                return value
+
+            collator = self.data_collator
+            tokenizer = getattr(collator, "tokenizer", None)
+            processor = getattr(collator, "processor", None)
+            image_processor = getattr(processor, "image_processor", None)
+            self._lego_signature = fingerprint({
+                "version": 1, "config": semantic(self._lego_config),
+                "data": dataset_identity(self.train_dataset), "eval": dataset_identity(self.eval_dataset),
+                "domains": self.domain_names,
+                "collator": f"{type(collator.collator).__module__}.{type(collator.collator).__qualname__}",
+                "loader": {key: getattr(self.args, key, None) for key in (
+                    "dataloader_num_workers", "dataloader_persistent_workers", "dataloader_prefetch_factor",
+                    "dataloader_drop_last",
+                )},
+                "tokenizer": tokenizer.get_vocab() if hasattr(tokenizer, "get_vocab") else str(tokenizer),
+                "padding_side": getattr(tokenizer, "padding_side", None),
+                "template": repr(getattr(collator, "template", None)),
+                "image_processor": image_processor.to_dict() if hasattr(image_processor, "to_dict") else None,
+            })
+        return self._lego_signature
 
     def _set_signature_columns_if_needed(self):
         super()._set_signature_columns_if_needed()
@@ -216,7 +276,7 @@ class LegoTrainer(SelectTrainer):
 
         Scheduling metadata is kept for weight stages, outside model.forward.
         """
-        if not self.pipeline.has_loss_stages(self.state.global_step):
+        if not model.training or not self.pipeline.has_loss_stages(self.state.global_step):
             return self._forward_without_metadata(
                 model, inputs, return_outputs=return_outputs, num_items_in_batch=num_items_in_batch
             )
@@ -276,7 +336,23 @@ class LegoTrainer(SelectTrainer):
 
     @override
     def training_step(self, model, inputs, num_items_in_batch=None):
-        loss = super().training_step(model, inputs, num_items_in_batch=num_items_in_batch)
+        ctx = self.plan_context(num_samples=0, step_id=self.state.global_step, model=model, batch=inputs)
+        with self.compute_loss_context_manager():
+            self.pipeline.prepare_loss_stages(ctx, model)
+        # Our scalar is reduced from per-sample losses, not the model's
+        # num_items_in_batch-normalized loss. Let HF apply accumulation scaling
+        # even for models whose forward accepts loss kwargs (e.g. Qwen).
+        weighted = self.pipeline.has_loss_stages(self.state.global_step)
+        accepts_loss_kwargs = self.model_accepts_loss_kwargs
+        compute_loss_func = self.compute_loss_func
+        try:
+            if weighted:
+                self.model_accepts_loss_kwargs = False
+                self.compute_loss_func = None
+            loss = super().training_step(model, inputs, num_items_in_batch=num_items_in_batch)
+        finally:
+            self.model_accepts_loss_kwargs = accepts_loss_kwargs
+            self.compute_loss_func = compute_loss_func
 
         self._update_reweighting_mixers(model, inputs)
 
@@ -326,6 +402,15 @@ class LegoTrainer(SelectTrainer):
     # Feedback and teardown
     # ------------------------------------------------------------------
 
+    def _save_checkpoint(self, model, trial, *args, **kwargs):
+        super()._save_checkpoint(model, trial, *args, **kwargs)
+        output = Path(self._get_output_dir(trial=trial)) / f"checkpoint-{self.state.global_step}"
+        save_atomic(output / f"dataflex_lego_rank_{self.args.process_index}.pt", {
+            "version": 1, "global_step": self.state.global_step,
+            "signature": self._selection_run_signature(),
+            "pipeline": pipeline_state(self.pipeline), "signals": self._last_signals,
+        })
+
     @override
     def _maybe_log_save_evaluate(self, tr_loss, grad_norm, model, trial, epoch, ignore_keys_for_eval, *args, **kwargs):
         self._last_signals = dict(
@@ -340,6 +425,28 @@ class LegoTrainer(SelectTrainer):
 
     @override
     def train(self, *args, **kwargs):
+        fa = self.finetuning_args
+        if fa.update_step <= 0 or fa.warmup_step < 0:
+            raise ValueError("LEGO requires update_step > 0 and warmup_step >= 0")
+        if any(s.family == "selector" and s.name == "delta_loss" for s in self.pipeline.index_stages):
+            if fa.update_times < 2:
+                raise ValueError("delta_loss selector requires update_times >= 2 for its baseline/window schedule")
+        resume = kwargs.get("resume_from_checkpoint", args[0] if args else None)
+        if resume is True:
+            resume = get_last_checkpoint(self.args.output_dir)
+        if resume:
+            path = Path(resume) / f"dataflex_lego_rank_{self.args.process_index}.pt"
+            if not path.exists():
+                raise ValueError(f"LEGO state is missing: {path}")
+            state = torch.load(path, map_location="cpu", weights_only=True)
+            trainer_state = json.loads((Path(resume) / "trainer_state.json").read_text())
+            if (state.get("version") != 1 or state.get("signature") != self._selection_run_signature()
+                    or state.get("global_step") != trainer_state["global_step"]):
+                raise ValueError("LEGO checkpoint dataset/config/schedule/step does not match")
+            restore_pipeline(self.pipeline, state["pipeline"], len(self.train_dataset))
+            self._active_plan = self.pipeline._plan
+            self._last_signals = state["signals"]
+            self._lego_restored_step = state["global_step"]
         result = super().train(*args, **kwargs)
         try:
             self.pipeline.on_train_end(self.args.output_dir)

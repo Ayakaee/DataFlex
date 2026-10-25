@@ -199,6 +199,8 @@ class SelectStage(IndexStage):
         if self.mode == "filter" and not (0.0 < self.keep_ratio <= 1.0):
             raise ValueError(f"keep_ratio must be in (0, 1], got {self.keep_ratio}")
         self.takes_budget = mode == "draw"
+        if mode == "filter" and getattr(component, "replacement", False):
+            raise ValueError("LEGO filter selection requires replacement: false")
 
     def _share_scores(self, plan: DataPlan, ctx: PlanContext) -> None:
         """Point the selector at the current pool and at the shared board.
@@ -235,6 +237,13 @@ class SelectStage(IndexStage):
             **ctx.as_component_kwargs(),
         )
         indices = list(indices or [])
+
+        if self.name in {"loss", "delta_loss", "adapt_inf", "random"}:
+            pool = set(plan.as_list())
+            if len(indices) != num or any(i not in pool for i in indices):
+                raise ValueError(f"{self.name} returned invalid IDs or a different selection budget")
+            if self.mode == "filter" and len(set(indices)) != len(indices):
+                raise ValueError(f"{self.name} returned duplicate IDs in filter mode")
 
         if self.mode == "filter":
             # A selector may return duplicates (several sample with replacement).
@@ -573,6 +582,11 @@ class WeightStage(LossStage):
     """
 
     family = "weighter"
+
+    def __init__(self, component, name, **kwargs):
+        super().__init__(component, name, **kwargs)
+        if self.every != 1:
+            raise ValueError("Weight stages apply every batch; configure refresh_interval on the weighter")
 
     def weights(self, losses: torch.Tensor, ctx: PlanContext, model=None, inputs=None) -> Optional[torch.Tensor]:
         fn = getattr(self.component, "get_sample_weights", None)

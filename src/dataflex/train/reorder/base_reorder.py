@@ -87,6 +87,23 @@ class Reorder(ABC):
         if provider is not None and hasattr(provider, "data_collator"):
             provider.data_collator = data_collator
 
+    def state_dict(self):
+        from copy import deepcopy
+
+        names = ("_candidate_pool", "_domain_ids", "_signals", "_order", "_cursor",
+                 "_pool", "_pending", "_call_count")
+        return {name: deepcopy(getattr(self, name)) for name in names if hasattr(self, name)}
+
+    def load_state_dict(self, state):
+        from copy import deepcopy
+
+        if set(state) != set(self.state_dict()):
+            raise ValueError("Reorder checkpoint fields do not match this component")
+        for name, value in state.items():
+            setattr(self, name, deepcopy(value))
+        if hasattr(self, "_provider"):
+            self._provider = None  # Rebuild callbacks against the resumed context.
+
     # ------------------------------------------------------------------
     # Composition hooks
     #

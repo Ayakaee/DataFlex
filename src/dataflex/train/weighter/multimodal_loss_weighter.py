@@ -19,6 +19,7 @@ from dataflex.train.data.metadata import split_batch
 from dataflex.core.registry import register_weighter
 from dataflex.utils.logging import logger
 from .base_weighter import Weighter
+from .lifecycle import IndexedWeightLifecycle
 
 IGNORE_INDEX = -100
 
@@ -52,7 +53,7 @@ class _IndexedDataset(Dataset):
 
 
 @register_weighter("multimodal_loss")
-class MultimodalLossWeighter(Weighter):
+class MultimodalLossWeighter(IndexedWeightLifecycle, Weighter):
     """多模态 Loss 重加权：s = L(R|Q,I)，一次有图前向。"""
 
     def __init__(
@@ -91,22 +92,11 @@ class MultimodalLossWeighter(Weighter):
         self._order = None
         logger.info(f"[MultimodalLoss] refresh_interval={refresh_interval}, delta={delta}")
 
-    def training_step(self, ctx, model, inputs, num_items_in_batch=None, use_weighter=False):
-        step = ctx.state.global_step
-        if use_weighter and step != self._last_refresh_step and \
-                (self.W is None or step % self.refresh_interval == 0):
-            self._refresh(ctx, model, step)
-            self._last_refresh_step = step
-        return super().training_step(ctx, model, inputs, num_items_in_batch, use_weighter)
-
     def get_weighted_loss(self, losses, *, ctx=None, model=None, inputs=None):
         if (not torch.is_tensor(losses)) or losses.dim() == 0:
             return losses
-        if not self._weight_map:
-            return losses.mean()
         losses = losses.view(-1)
-        w = torch.tensor([self._weight_map.get(k, 1.0) for k in _sample_keys(inputs)],
-                         dtype=losses.dtype, device=losses.device)
+        w = self._batch_weights(inputs, losses, _sample_keys)
         if self.loss_reduction == "token":
             n = (inputs["labels"][..., 1:] != IGNORE_INDEX).sum(dim=1).to(losses.dtype)
             return torch.sum(w * losses * n) / n.sum().clamp_min(1)
@@ -148,20 +138,22 @@ class MultimodalLossWeighter(Weighter):
                     per_loss.append(torch.tensor(float("nan"), device=logits.device))
             loss_l.append(torch.stack(per_loss))
             idx_l.append(batch["idx"])
-            key_l.append(torch.frombuffer(bytearray(b"".join(_sample_keys(main))), dtype=torch.uint8)
-                         .view(-1, 16).to(acc.device))
+            if "idx" not in main:
+                key_l.append(torch.frombuffer(bytearray(b"".join(_sample_keys(main))), dtype=torch.uint8)
+                             .view(-1, 16).to(acc.device))
         if was_training:
             model.train()
         torch.cuda.empty_cache()
 
         all_idx = acc.gather(torch.cat(idx_l)).cpu()
-        all_keys = acc.gather(torch.cat(key_l)).cpu().numpy()
+        all_keys = acc.gather(torch.cat(key_l)).cpu().numpy() if key_l else None
         vals = acc.gather(torch.cat(loss_l)).float().cpu()
         score = torch.full((n,), float("nan"))
         score[all_idx] = vals
 
         self.W = self._score_to_weight(score)
-        self._weight_map = {k.tobytes(): float(self.W[i]) for k, i in zip(all_keys, all_idx.tolist())}
+        self._weight_map = ({k.tobytes(): float(self.W[i]) for k, i in zip(all_keys, all_idx.tolist())}
+                            if all_keys is not None else {})
 
         if not dist.is_initialized() or dist.get_rank() == 0:
             v = torch.isfinite(score)
@@ -174,6 +166,8 @@ class MultimodalLossWeighter(Weighter):
 
     def _score_to_weight(self, score):
         valid = torch.isfinite(score)
+        if not valid.any():
+            raise ValueError("Cannot refresh weights: no finite answer-token losses")
         s = score.clone()
         lo = torch.quantile(s[valid], self.clip_quantile).item()
         hi = torch.quantile(s[valid], 1 - self.clip_quantile).item()
@@ -185,12 +179,3 @@ class MultimodalLossWeighter(Weighter):
         w = w / w[valid].mean()
         w[~valid] = 1.0
         return w
-
-    def _get_length_order(self):
-        if self._order is None:
-            lens = self.dataset.map(
-                lambda b: {"_n": [len(x) for x in b["input_ids"]]},
-                batched=True, remove_columns=self.dataset.column_names, keep_in_memory=True,
-            )["_n"]
-            self._order = torch.tensor(lens).argsort(descending=True).tolist()
-        return self._order

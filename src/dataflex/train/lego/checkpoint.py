@@ -1,0 +1,194 @@
+"""Explicit, tensor/primitive-only checkpoints for supported LEGO components."""
+
+import hashlib
+import os
+from pathlib import Path
+
+import numpy as np
+import torch
+
+from dataflex.utils.multimodal_selection import fingerprint
+
+from .plan import DataPlan
+
+
+def dataset_identity(dataset):
+    """Identify processed rows and referenced media snapshots, not just length.
+
+    External files are identified by path/size/mtime, not re-read in full. Their
+    snapshot must stay immutable for exact resume (as for ordinary HF training).
+    """
+    if dataset is None:
+        return None
+    if isinstance(dataset, dict):
+        return {key: dataset_identity(value) for key, value in dataset.items()}
+    from dataflex.train.data.metadata import DomainLabeledDataset
+
+    if isinstance(dataset, DomainLabeledDataset):
+        return fingerprint({"data": dataset_identity(dataset.dataset), "domains": dataset.domain_ids.tolist()})
+    revision = getattr(dataset, "_fingerprint", None)
+    media = hashlib.sha256()
+    seen = set()
+
+    def record(value):
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                record(item)
+        elif isinstance(value, dict):
+            record(value.get("path"))
+        elif isinstance(value, str) and value not in seen:
+            seen.add(value)
+            path = Path(value)
+            stat = path.stat() if path.is_file() else None
+            media.update(
+                fingerprint([value, stat.st_size if stat else None, stat.st_mtime_ns if stat else None]).encode()
+            )
+
+    if revision is not None:
+        for field in ("images", "videos", "audios"):
+            if field in (getattr(dataset, "column_names", None) or []):
+                for value in dataset[field]:
+                    record(value)
+    else:
+        rows = hashlib.sha256()
+        for i in range(len(dataset)):
+            row = dataset[i]
+            rows.update(fingerprint(row).encode())
+            for field in ("images", "videos", "audios"):
+                record(row.get(field))
+        revision = rows.hexdigest()
+    return fingerprint({"revision": revision, "length": len(dataset), "media": media.hexdigest()})
+
+
+def portable(value):
+    """Avoid pickling modules, callbacks, or device-dependent objects."""
+    if torch.is_tensor(value):
+        return value.detach().cpu().clone()
+    if isinstance(value, np.ndarray):
+        return torch.from_numpy(value.copy())
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {key: portable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [portable(item) for item in value]
+    if value is None or isinstance(value, (str, bytes, int, float, bool)):
+        return value
+    raise TypeError(f"Unsupported LEGO checkpoint value: {type(value).__name__}")
+
+
+def unsupported_stages(pipeline):
+    from dataflex.train.reorder.dynamic_reorder import DynamicReorder
+    from dataflex.train.reorder.static_reorder import StaticReorder
+
+    supported = {
+        "selector": {"loss", "delta_loss", "adapt_inf", "random"},
+        "mixer": {"static", "random"},
+        "weighter": {"loss", "multimodal_loss", "multimodal_deltaloss", "multimodal_adapt"},
+        "reorder": {"static", "dynamic"},
+    }
+    return [
+        f"{stage.family}:{stage.name}"
+        for stage in (*pipeline.index_stages, *pipeline.loss_stages)
+        if stage.component is not None
+        and not (stage.family == "reorder" and type(stage.component) in (StaticReorder, DynamicReorder))
+        and stage.name not in supported.get(stage.family, set())
+    ]
+
+
+def pipeline_state(pipeline):
+    stages = []
+    for stage in (*pipeline.index_stages, *pipeline.loss_stages):
+        component = stage.component
+        export = getattr(component, "state_dict", None)
+        stages.append(
+            {
+                "identity": [stage.family, stage.name],
+                "last_run_step": stage._last_run_step,
+                "cached": stage._cached,
+                "last_probs": getattr(stage, "_last_probs", None),
+                "last_batch_update": getattr(stage, "_last_batch_update", None),
+                "candidate_pool": getattr(component, "_candidate_pool", None),
+                "component": export() if callable(export) else None,
+            }
+        )
+    plan = pipeline._plan
+    board = pipeline.scoreboard
+    return portable(
+        {
+            "version": 1,
+            "unsupported": unsupported_stages(pipeline),
+            "stages": stages,
+            "stage_out": pipeline._stage_out,
+            "plan": None if plan is None else {"indices": plan.indices, "weights": plan.weights, "meta": plan.meta},
+            "scoreboard": None
+            if board is None
+            else {
+                "values": board._values,
+                "scored_at": board._scored_at,
+                "step": board._step,
+                "compute_calls": board.compute_calls,
+                "cache_hits": board.cache_hits,
+            },
+        }
+    )
+
+
+def restore_pipeline(pipeline, state, dataset_size):
+    if state.get("version") != 1:
+        raise ValueError("Unsupported LEGO checkpoint schema")
+    unsupported = unsupported_stages(pipeline) or state.get("unsupported")
+    if unsupported:
+        raise ValueError(f"LEGO resume is not implemented for {unsupported}; ODM state is deliberately excluded")
+    stages = [*pipeline.index_stages, *pipeline.loss_stages]
+    if len(state["stages"]) != len(stages) or len(state["stage_out"]) != len(pipeline.index_stages):
+        raise ValueError("LEGO checkpoint stage count differs")
+
+    def indices(value):
+        if value is None:
+            return None
+        arr = np.asarray(value, dtype=np.int64)
+        if arr.ndim != 1 or (arr < 0).any() or (arr >= dataset_size).any():
+            raise ValueError("LEGO checkpoint has invalid dataset indices")
+        return arr.copy()
+
+    for stage, saved in zip(stages, state["stages"]):
+        if saved["identity"] != [stage.family, stage.name]:
+            raise ValueError("LEGO checkpoint stage identity differs")
+        stage._last_run_step, stage._cached = saved["last_run_step"], saved["cached"]
+        if hasattr(stage, "_last_probs"):
+            stage._last_probs = None if saved["last_probs"] is None else np.asarray(saved["last_probs"]).copy()
+            stage._last_batch_update = saved["last_batch_update"]
+        if saved["component"] is not None:
+            stage.component.load_state_dict(saved["component"])
+        if hasattr(stage.component, "_candidate_pool"):
+            pool = indices(saved["candidate_pool"])
+            stage.component._candidate_pool = None if pool is None else pool.tolist()
+    pipeline._stage_out = [indices(value) for value in state["stage_out"]]
+    plan = state["plan"]
+    pipeline._plan = (
+        None
+        if plan is None
+        else DataPlan(
+            indices(plan["indices"]),
+            None if plan["weights"] is None else np.asarray(plan["weights"]).copy(),
+            dict(plan["meta"]),
+        )
+    )
+    saved = state["scoreboard"]
+    if saved is not None and pipeline.scoreboard is not None:
+        board = pipeline.scoreboard
+        for field in ("values", "scored_at"):
+            values = {key: np.asarray(value).copy() for key, value in saved[field].items()}
+            if any(value.shape != (dataset_size,) for value in values.values()):
+                raise ValueError("ScoreBoard checkpoint does not match the dataset")
+            setattr(board, "_" + field, values)
+        board._step = dict(saved["step"])
+        board.compute_calls, board.cache_hits = dict(saved["compute_calls"]), dict(saved["cache_hits"])
+
+
+def save_atomic(path, state):
+    path = Path(path)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(portable(state), temporary)
+    os.replace(temporary, path)

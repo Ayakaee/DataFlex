@@ -133,7 +133,7 @@ class LossSelector(Selector):
         model.eval()
         os.makedirs(self.cache_dir, exist_ok=True)
         save_path = os.path.join(self.cache_dir, f"step_{step_id}.json")
-        if os.path.exists(save_path):
+        if getattr(self, "reuse_selection_cache", True) and os.path.exists(save_path):
             if self.accelerator.is_main_process:
                 cached_indices, _ = load_cached_selection(save_path)
             else:

@@ -29,14 +29,13 @@ from .stages import (
 def _provides_sample_weights(component) -> bool:
     """Whether a weighter actually implements per-sample multipliers.
 
-    `Weighter.get_sample_weights` is defined on the abstract base and returns
-    None, so `hasattr` is true for every weighter and cannot tell "implemented"
-    from "inherited". Comparing against the base implementation can.
+    An absent method is scalar-only. If the base later gains a placeholder,
+    inheriting it still must not count as implementing sample weights.
     """
     from dataflex.train.weighter.base_weighter import Weighter
 
     own = getattr(type(component), "get_sample_weights", None)
-    return own is not None and own is not Weighter.get_sample_weights
+    return own is not None and own is not getattr(Weighter, "get_sample_weights", None)
 
 
 class SchedulePipeline:
@@ -115,6 +114,10 @@ class SchedulePipeline:
                 stage_runtime["cache_dir"] = os.path.join(cache_dir, f"{family}_{component_name}")
 
             component = cls._build_component(family, component_name, params, stage_runtime)
+            if family == "selector" and component_name in {"loss", "delta_loss"}:
+                # Step-only JSON caches cannot identify a model/run. LEGO resume
+                # restores its actual stage state instead of accepting those files.
+                component.reuse_selection_cache = False
 
             stage_cls = STAGE_TYPES[family]
             stage = stage_cls(component, component_name, **entry)
@@ -361,6 +364,14 @@ class SchedulePipeline:
 
     def has_loss_stages(self, step_id: int) -> bool:
         return any(s.is_active(step_id) for s in self.loss_stages)
+
+    def prepare_loss_stages(self, ctx: PlanContext, model) -> None:
+        """Refresh before the differentiable training forward, never in evaluation."""
+        for stage in self.loss_stages:
+            if isinstance(stage, WeightStage) and stage.is_active(ctx.step_id):
+                prepare = getattr(stage.component, "prepare", None)
+                if callable(prepare):
+                    prepare(ctx, model)
 
     def weighted_loss(
         self,

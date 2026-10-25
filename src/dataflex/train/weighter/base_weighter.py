@@ -18,6 +18,10 @@ class Weighter(ABC):
         """
         # Subclasses can define common initialization logic here
         pass
+
+    def prepare(self, ctx, model):
+        """Refresh optional component state before the training forward."""
+        return None
     
     def _per_sample_loss_from_logits(self, logits, labels, ignore_index: int = -100):
         """
@@ -81,6 +85,11 @@ class Weighter(ABC):
         from dataflex.utils.logging import logger
         from transformers.utils import is_apex_available
         from accelerate.utils import DistributedType
+
+        if use_weighter:
+            from .lifecycle import component_context
+
+            self.prepare(component_context(ctx, model=model, batch=inputs), model)
         
         model.train()
         if hasattr(ctx.optimizer, "train") and callable(ctx.optimizer.train):
@@ -122,7 +131,8 @@ class Weighter(ABC):
                     ps = per_sample.detach().float().cpu().view(-1)[0]
                     logger.info(f"[Dataflex] Before weighting per-sample (first sample): {ps}")
                 # Distributed weighting
-                loss = self.get_weighted_loss(per_sample, ctx=ctx, model=model, inputs=inputs)
+                with ctx.compute_loss_context_manager():
+                    loss = self.get_weighted_loss(per_sample, ctx=ctx, model=model, inputs=inputs)
                 reweighted = True
                 if ctx.args.local_rank in [-1, 0]:
                     logger.info(f"[Dataflex] After weighting (first sample): {float(loss.detach().cpu())}")
