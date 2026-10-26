@@ -116,27 +116,19 @@ def pipeline_state(pipeline):
     board = pipeline.scoreboard
     return portable(
         {
-            "version": 1,
+            "version": 2,
             "unsupported": unsupported_stages(pipeline),
             "stages": stages,
             "stage_out": pipeline._stage_out,
             "plan": None if plan is None else {"indices": plan.indices, "weights": plan.weights, "meta": plan.meta},
-            "scoreboard": None
-            if board is None
-            else {
-                "values": board._values,
-                "scored_at": board._scored_at,
-                "step": board._step,
-                "compute_calls": board.compute_calls,
-                "cache_hits": board.cache_hits,
-            },
+            "scoreboard": None if board is None else board.state_dict(),
         }
     )
 
 
 def restore_pipeline(pipeline, state, dataset_size):
-    if state.get("version") != 1:
-        raise ValueError("Unsupported LEGO checkpoint schema")
+    if state.get("version") != 2:
+        raise ValueError("Unsupported LEGO checkpoint schema; checkpoints from before shared scoring need a new run")
     unsupported = unsupported_stages(pipeline)
     if unsupported:
         raise ValueError(f"LEGO resume is not implemented for {unsupported}")
@@ -184,14 +176,7 @@ def restore_pipeline(pipeline, state, dataset_size):
     )
     saved = state["scoreboard"]
     if saved is not None and pipeline.scoreboard is not None:
-        board = pipeline.scoreboard
-        for field in ("values", "scored_at"):
-            values = {key: np.asarray(value).copy() for key, value in saved[field].items()}
-            if any(value.shape != (dataset_size,) for value in values.values()):
-                raise ValueError("ScoreBoard checkpoint does not match the dataset")
-            setattr(board, "_" + field, values)
-        board._step = dict(saved["step"])
-        board.compute_calls, board.cache_hits = dict(saved["compute_calls"]), dict(saved["cache_hits"])
+        pipeline.scoreboard.load_state_dict(saved)
 
 
 def save_atomic(path, state):

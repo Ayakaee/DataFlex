@@ -59,6 +59,15 @@ class SchedulePipeline:
         self.save_plans = bool(save_plans)
 
         self._validate()
+        for i, stage in enumerate((*self.index_stages, *self.loss_stages)):
+            # Stable even when the same algorithm occurs twice in a pipeline.
+            stage.score_consumer = f"{i}:{stage.family}:{stage.name}"
+            if scoreboard is not None and (
+                isinstance(stage, SelectStage)
+                or (isinstance(stage, ReorderStage) and getattr(stage.component, "score_source", None) == "model_loss")
+                or stage.name in {"multimodal_loss", "multimodal_deltaloss"}
+            ):
+                stage.validate_score_options()
 
         self._plan: Optional[DataPlan] = None
         #: What each index stage last handed downstream, one slot per stage, so a
@@ -369,6 +378,11 @@ class SchedulePipeline:
         """Refresh before the differentiable training forward, never in evaluation."""
         for stage in self.loss_stages:
             if isinstance(stage, WeightStage) and stage.is_active(ctx.step_id):
+                setter = getattr(stage.component, "set_score_source", None)
+                if callable(setter):
+                    if ctx.scoreboard is not None and stage.component.dataset is not ctx.scoreboard.dataset:
+                        raise ValueError("LEGO weighter and ScoreBoard must reference the same global training dataset")
+                    setter(stage.board_score_fn(ctx))
                 prepare = getattr(stage.component, "prepare", None)
                 if callable(prepare):
                     prepare(ctx, model)

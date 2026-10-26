@@ -212,6 +212,11 @@ def test_weight_warmup_prepare_and_eval_do_not_refresh(lego, tmp_path):
     trainer = make_trainer(lego, tmp_path)
     data, model = dataset(), VisionModel()
     component = weighter("loss", trainer, data)
+    # Shared scoring and the component must reference the same global rows.
+    trainer.train_dataset = data
+    trainer.scoreboard.dataset = data
+    trainer.scoreboard.dataset_size = len(data)
+    trainer.selector.data_collator = component.data_collator
     trainer.pipeline.loss_stages = [WeightStage(component, "multimodal_loss", warmup_step=2)]
     for step in (0, 1):
         ctx = trainer.plan_context(0, step, model=model)
@@ -238,7 +243,10 @@ def test_checkpoint_rejects_changed_data_and_legacy_unsupported_state(lego, tmp_
         restore_pipeline(trainer.pipeline, state, len(trainer.train_dataset))
 
 
-def training_trainer(lego, directory, selector, mixer, reorder, weight):
+def training_trainer(
+    lego, directory, selector, mixer, reorder, weight, *,
+    score_sharing="shared", score_source="precomputed", refresh_interval=3, score_batch_size=8,
+):
     from dataflex.train.hparams.dynamic_params import DynamicFinetuningArguments
 
     directory.mkdir(parents=True, exist_ok=True)
@@ -248,6 +256,8 @@ def training_trainer(lego, directory, selector, mixer, reorder, weight):
             "test": {
                 "params": {
                     "score_num_workers": 0,
+                    "score_batch_size": score_batch_size,
+                    "score_sharing": score_sharing,
                     "stages": [
                         {
                             "family": "selector",
@@ -273,12 +283,12 @@ def training_trainer(lego, directory, selector, mixer, reorder, weight):
             reorder: {
                 "params": {
                     "apply_at": "index",
-                    "score_source": "precomputed",
+                    "score_source": score_source,
                     "score_params": {"scores": list(range(16))},
                 }
             }
         },
-        "weighters": {weight: {"params": {"refresh_interval": 3, "score_num_workers": 0, "score_batch_size": 4}}},
+        "weighters": {weight: {"params": {"refresh_interval": refresh_interval, "score_num_workers": 0, "score_batch_size": 4}}},
     }
     path = directory / "components.yaml"
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:

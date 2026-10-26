@@ -103,6 +103,7 @@ class LegoTrainer(SelectTrainer):
 
         name = finetuning_args.component_name
         cfg = load_component("pipelines", finetuning_args.components_cfg_file, name, runtime_vars={})
+        cfg.setdefault("score_sharing", "shared")
         stages_cfg = cfg.get("stages")
         if not stages_cfg:
             raise ValueError(
@@ -124,6 +125,7 @@ class LegoTrainer(SelectTrainer):
             num_workers=int(cfg.get("score_num_workers", 2)),
             cache_dir=cfg.get("cache_dir"),
             seed=int(cfg.get("seed", 42)),
+            score_sharing=cfg["score_sharing"],
         )
 
         # A stand-in for `mixture_manager`: the mixers read `names` /
@@ -214,7 +216,9 @@ class LegoTrainer(SelectTrainer):
             processor = getattr(collator, "processor", None)
             image_processor = getattr(processor, "image_processor", None)
             self._lego_signature = fingerprint({
-                "version": 1, "config": semantic(self._lego_config),
+                "version": 2, "config": semantic(self._lego_config),
+                "scoring": self.scoreboard.scoring_contract,
+                "precision": {key: getattr(self.args, key, None) for key in ("bf16", "fp16", "tf32")},
                 "data": dataset_identity(self.train_dataset), "eval": dataset_identity(self.eval_dataset),
                 "domains": self.domain_names,
                 "collator": f"{type(collator.collator).__module__}.{type(collator.collator).__qualname__}",
@@ -439,6 +443,8 @@ class LegoTrainer(SelectTrainer):
             if not path.exists():
                 raise ValueError(f"LEGO state is missing: {path}")
             state = torch.load(path, map_location="cpu", weights_only=True)
+            if state.get("pipeline", {}).get("version") != 2:
+                raise ValueError("Unsupported LEGO checkpoint schema; checkpoints from before shared scoring need a new run")
             trainer_state = json.loads((Path(resume) / "trainer_state.json").read_text())
             if (state.get("version") != 1 or state.get("signature") != self._selection_run_signature()
                     or state.get("global_step") != trainer_state["global_step"]):

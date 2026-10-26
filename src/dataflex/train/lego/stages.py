@@ -53,14 +53,11 @@ class Stage(ABC):
         self.name = name
         self.warmup_step = int(warmup_step or 0)
         self.every = max(1, int(every or 1))
-        #: How stale a shared score may be before this stage forces a recompute,
-        #: in optimizer steps. 0 means "only this boundary's value counts". Raising
-        #: it lets a frequently-firing stage reuse a score refreshed by a slower
-        #: one instead of paying for its own forward pass.
+        #: Kept for explicit validation of older configurations. Exact LEGO
+        #: loss scoring accepts only zero; component refresh clocks are separate.
         self.score_max_age = int(score_max_age or 0)
         self._last_run_step: Optional[int] = None
         self._cached: Optional[Any] = None
-        self._warned_score_cap = False
 
     def is_active(self, step_id: int) -> bool:
         """Whether this stage participates at all yet."""
@@ -87,44 +84,25 @@ class Stage(ABC):
                 logger.warning(f"[Dataflex][Lego] {self.name}.observe failed: {exc}")
 
     def board_score_fn(self, ctx: PlanContext):
-        """`fn(positions) -> scores` reading per-sample loss off the shared board.
-
-        This is the whole mechanism behind "compute the signal once per
-        boundary": every stage that wants per-sample loss asks the board for the
-        metric named "loss", and only the first asker actually pays for a
-        forward pass. Returns None when there is no board to share.
-        """
+        """Current-step answer loss through the common scoring backend."""
         if ctx.scoreboard is None:
             return None
+        self.validate_score_options()
+        consumer = getattr(self, "score_consumer", f"{self.family}:{self.name}")
 
-        stage = self
-
-        def fn(positions, model=None, step_id: Optional[int] = None):
-            step = ctx.step_id if step_id is None else step_id
-            params = getattr(stage.component, "score_params", {}) or {}
-            if params.get("max_samples") and not stage._warned_score_cap:
-                stage._warned_score_cap = True
-                logger.warning(
-                    f"[Dataflex][Lego] {stage.family}:{stage.name} sets max_samples="
-                    f"{params['max_samples']}, but the cap belongs to whichever stage triggers "
-                    f"the computation of a metric. A stage asking earlier in the same boundary "
-                    f"without a cap will score the whole pool and this one then hits the cache, "
-                    f"so the cap can silently not apply"
-                )
-            compute = ctx.scoreboard.per_sample_loss_fn(
+        def fn(positions, model=None, step_id=None, metric="loss_full"):
+            return ctx.scoreboard.loss_scores(
                 model if model is not None else ctx.model,
-                step,
-                max_samples=params.get("max_samples"),
-            )
-            return ctx.scoreboard.get(
-                "loss",
-                positions,
-                step_id=step,
-                compute_fn=compute,
-                max_age=stage.score_max_age,
+                positions, ctx.step_id if step_id is None else step_id,
+                consumer=consumer, metric=metric,
             ).tolist()
 
         return fn
+
+    def validate_score_options(self):
+        params = getattr(self.component, "score_params", {}) or {}
+        if self.score_max_age != 0 or params.get("max_samples") is not None:
+            raise ValueError("LEGO loss scoring requires score_max_age: 0 and no max_samples approximation")
 
     def describe(self) -> str:
         bits = [f"{self.family}={self.name}"]
@@ -230,11 +208,16 @@ class SelectStage(IndexStage):
         else:
             num = max(1, int(len(plan) * self.keep_ratio))
 
+        kwargs = ctx.as_component_kwargs()
+        if self.name == "adapt_inf" and ctx.scoreboard is not None:
+            kwargs["publish_loss"] = ctx.scoreboard.adapt_inf_publisher(
+                ctx.model, ctx.step_id, consumer=getattr(self, "score_consumer", "selector:adapt_inf")
+            )
         indices = self.component.select(
             model=ctx.model,
             step_id=ctx.step_id,
             num_samples=num,
-            **ctx.as_component_kwargs(),
+            **kwargs,
         )
         indices = list(indices or [])
 
@@ -553,7 +536,7 @@ class ReorderStage(IndexStage):
             is_dynamic = True
 
             def describe(self):
-                return "scoreboard(loss)"
+                return "scoreboard(loss_full)"
 
             def scores_for(self, positions, model=None, step_id: int = 0):
                 return fn(positions, model=model, step_id=step_id)

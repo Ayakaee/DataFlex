@@ -24,6 +24,7 @@ from torch.utils.data import DataLoader, Dataset
 from dataflex.train.data.metadata import split_batch
 from dataflex.core.registry import register_weighter
 from dataflex.utils.logging import logger
+from dataflex.utils.vision_ablation import strip_vision_tokens, vision_token_ids
 from .base_weighter import Weighter
 from .lifecycle import IndexedWeightLifecycle
 
@@ -117,12 +118,17 @@ class MultimodalDeltalossWeighter(IndexedWeightLifecycle, Weighter):
 
     @torch.no_grad()
     def _refresh(self, ctx, model, step):
+        loss_full = self._source_scores("loss_full")
+        if loss_full is not None:
+            loss_noimg = self._source_scores("loss_no_image")
+            score = loss_noimg - loss_full
+            self.W = self._score_to_weight(score)
+            self._weight_map = {}
+            self._log_and_save(step, score, loss_full, loss_noimg)
+            return
         acc = ctx.accelerator
         if self._vision_ids is None:
-            cfg = acc.unwrap_model(model).config
-            img_id = getattr(cfg, "image_token_id", None) or getattr(cfg, "image_token_index", None)
-            self._vision_ids = (getattr(cfg, "vision_start_token_id", None),
-                                getattr(cfg, "vision_end_token_id", None), img_id)
+            self._vision_ids = vision_token_ids(acc.unwrap_model(model).config)
 
         n = len(self.dataset)
         order = self._get_length_order()
@@ -211,30 +217,8 @@ class MultimodalDeltalossWeighter(IndexedWeightLifecycle, Weighter):
     # ---- 去图 ----
 
     def _strip_vision(self, batch):
-        """删掉视觉 token，兼容 Qwen-VL（vision_start…end）和 LLaVA（image token id）。"""
-        vs, ve, img_id = self._vision_ids
-        ids, am, labels = batch["input_ids"], batch["attention_mask"], batch["labels"]
-        # 没有视觉 token 配置时直接返回原 batch（纯文本模型）
-        if vs is None and img_id is None:
-            return batch
-        rows = []
-        for i in range(ids.size(0)):
-            valid = am[i] != 0
-            r_ids, r_lab = ids[i][valid], labels[i][valid]
-            if vs is not None:  # Qwen-VL 类
-                s, e = (r_ids == vs).long(), (r_ids == ve).long()
-                inside = (s.cumsum(0) - e.cumsum(0) + e) > 0
-            else:  # LLaVA 类
-                inside = r_ids == img_id
-            rows.append((r_ids[~inside], r_lab[~inside]))
-        L = max(len(r[0]) for r in rows)
-        new_ids = ids.new_zeros((len(rows), L))
-        new_lab = labels.new_full((len(rows), L), IGNORE_INDEX)
-        new_am = am.new_zeros((len(rows), L))
-        for i, (r_ids, r_lab) in enumerate(rows):
-            n = len(r_ids)
-            new_ids[i, :n], new_lab[i, :n], new_am[i, :n] = r_ids, r_lab, 1
-        return {"input_ids": new_ids, "attention_mask": new_am, "labels": new_lab}
+        """Delete visual tokens, using the same condition as LEGO scoring."""
+        return strip_vision_tokens(batch, self._vision_ids)
 
     # ---- 工具 ----
 

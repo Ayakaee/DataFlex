@@ -29,6 +29,19 @@ def scoring_mode(model):
 class IndexedWeightLifecycle:
     """Periodic full-dataset refresh, followed by lookup in processed-row space."""
 
+    def set_score_source(self, source):
+        """LEGO supplies raw scores; standalone weighters retain their scorer."""
+        self._score_source = source
+
+    def _source_scores(self, metric):
+        source = getattr(self, "_score_source", None)
+        if source is None:
+            return None
+        scores = torch.as_tensor(source(range(len(self.dataset)), metric=metric), dtype=torch.float32)
+        if scores.shape != (len(self.dataset),):
+            raise ValueError("Score source does not match the global weight table")
+        return scores
+
     def prepare(self, ctx, model):
         ctx = component_context(ctx, model=model)
         if self.refresh_interval <= 0:

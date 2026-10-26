@@ -104,6 +104,12 @@ class MultimodalLossWeighter(IndexedWeightLifecycle, Weighter):
 
     @torch.no_grad()
     def _refresh(self, ctx, model, step):
+        score = self._source_scores("loss_full")
+        if score is not None:
+            self.W = self._score_to_weight(score)
+            self._weight_map = {}
+            self._log_and_save(step, score)
+            return
         acc = ctx.accelerator
         n = len(self.dataset)
         order = self._get_length_order()
@@ -154,10 +160,12 @@ class MultimodalLossWeighter(IndexedWeightLifecycle, Weighter):
         self.W = self._score_to_weight(score)
         self._weight_map = ({k.tobytes(): float(self.W[i]) for k, i in zip(all_keys, all_idx.tolist())}
                             if all_keys is not None else {})
+        self._log_and_save(step, score)
 
+    def _log_and_save(self, step, score):
         if not dist.is_initialized() or dist.get_rank() == 0:
             v = torch.isfinite(score)
-            logger.info(f"[MultimodalLoss] step {step}: valid={int(v.sum())}/{n}, "
+            logger.info(f"[MultimodalLoss] step {step}: valid={int(v.sum())}/{len(score)}, "
                         f"L(Q,I) mean={score[v].mean():.4f}, weight [{self.W.min():.3f}, {self.W.max():.3f}]")
             if self.cache_dir:
                 os.makedirs(self.cache_dir, exist_ok=True)

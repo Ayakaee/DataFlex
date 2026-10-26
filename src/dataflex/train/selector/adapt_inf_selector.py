@@ -234,6 +234,7 @@ class AdaptInfSelector(Selector):
         cached = _broadcast(cached)
         if cached is not None:
             self.last_metadata = {**cached, "cache_hit": True}
+            self._publish_loss_scores(directory, positions, kwargs.get("publish_loss"))
             return cached["selected_indices"]
         rows = np.arange(rank, len(positions), world)
         dimension = self.proj_dim
@@ -442,7 +443,30 @@ class AdaptInfSelector(Selector):
         if "error" in payload:
             raise RuntimeError(payload["error"])
         self.last_metadata = payload["result"]
+        self._publish_loss_scores(directory, positions, kwargs.get("publish_loss"))
         return payload["result"]["selected_indices"]
+
+    def _publish_loss_scores(self, directory, positions, publish):
+        """Expose existing normal-image CE only; never publish the IG condition.
+
+        Old/pruned selection caches may lack raw scores. Selection remains
+        usable then and subsequent LEGO consumers compute their own scores.
+        """
+        if publish is None:
+            return
+        values = None
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            try:
+                saved_positions = np.load(directory / "dataset_positions.npy", allow_pickle=False)
+                scores = np.load(directory / "scores.npy", mmap_mode="r", allow_pickle=False)
+                if (np.array_equal(saved_positions, positions) and scores.shape == (len(positions), 4)
+                        and np.isfinite(scores[:, 0]).all()):
+                    values = scores[:, 0].tolist()
+            except (OSError, ValueError):
+                pass
+        values = _broadcast(values)
+        if values is not None:
+            publish(positions, values)
 
     def _project_gradients(self, gradients):
         """Use the same TRAK backend selection and seed as the released code."""

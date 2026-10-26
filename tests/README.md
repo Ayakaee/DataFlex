@@ -105,6 +105,68 @@ and include a two-rank resume check in the DDP script. The
 Adapt-inf test covers the LEGO adapter boundary; its gradient projection and
 image-IG algorithm are not reimplemented or fully exercised by these fixtures.
 
+## Shared and independent scoring
+
+Select `component_name: multimodal_lego` with `train_type: dynamic_lego` and
+`components_cfg_file: src/dataflex/configs/components.yaml` in an image-text
+training configuration. Configure the actual model, dataset/template, domain
+proportions and schedule as usual. The switch belongs to the **pipeline preset**,
+not the Trainer's top-level YAML:
+
+```yaml
+pipelines:
+  multimodal_lego:
+    params:
+      score_sharing: shared  # change ONLY this to independent for the baseline
+      score_batch_size: 8
+      score_num_workers: 2
+      stages: ...           # keep the same stages and refresh settings
+```
+
+- `shared` (default) reuses compatible scores across components. `independent`
+  gives each stage a private namespace while retaining its normal cache,
+  refresh clock, selection baseline and weight table. Both use the same scorer,
+  batch size, precision, response-label mask and input-ablation implementation.
+- `loss_full` is FP32 token-mean answer CE from an eval-mode, no-grad image-text
+  forward. Loss/DeltaLoss selectors, model-loss reorder, and multimodal
+  Loss/DeltaLoss weighters request it. `loss_no_image` deletes visual tokens
+  using the existing DeltaLoss ablation and is a separate cache entry. The
+  weighter's score-to-weight formula is unchanged. Standalone WeightTrainer
+  still uses its own scorer and its component-level batch settings.
+- Entries are aligned by global row ID and optimizer step. Partial pools only
+  compute missing IDs; known-invalid answer losses remain NaN, not median-filled
+  or silently reused from an older model step. Component refresh clocks are
+  unchanged. A weighter still scores the full dataset when its refresh is due.
+- Exact LEGO scoring requires `score_max_age: 0` and no `max_samples` cap.
+  Incompatible options fail at pipeline construction. The provided LEGO
+  presets use `lego_dynamic_saw`, an uncapped version of `dynamic_saw`; the
+  standalone capped reorder preset is unchanged. Scoring batch/worker settings
+  come from the pipeline rather than the component presets.
+- Image preprocessing/collation must be deterministic and use an immutable
+  snapshot. Scoring preserves Torch/Python/NumPy RNG, module modes and model
+  rope state. Different subset batch shapes can still produce floating-point
+  rounding differences, so parity checks use numerical tolerances.
+- ADAPT-INF keeps its existing gradient/projection/clustering/IG calculations.
+  It publishes detached normal-image answer loss only in shared mode with
+  `score_batch_size: 1` and ordinary eval scoring (currently excludes its LLaVA
+  checkpointing path). Its zero-pixel IG is never treated as `loss_no_image`.
+  Cached selections with missing raw scores simply trigger ordinary scoring
+  downstream. Publication does not replace the forward needed for gradients.
+- Multimodal ADAPT's anchor/batch embedding forwards are unchanged. Training
+  forwards are not cached as scoring passes. ODM feedback attribution is
+  unchanged. No timing, GPU-hours or new efficiency-reporting system is added.
+
+Pipeline checkpoint schema 2 stores the score namespaces and scoring contract.
+Changing sharing mode, scoring settings or precision on resume is rejected.
+Checkpoints from before this scoring contract require a new run; they are not
+silently converted to caches with different semantics.
+
+`test_lego_sharing.py` checks partial-pool reuse, both image conditions, invalid
+answers, RNG/mode restoration (including errors), standalone weight-formula
+parity, shared/independent end-to-end parity and resume in both modes. The DDP
+script also checks two-rank shared/independent parity and fewer actual scored
+samples. ADAPT-INF publication is tested separately from its expensive
+projection/clustering implementation.
+
 These tests do not validate real VLM processors, CUDA, ZeRO/FSDP, benchmark
-quality or GPU-hours. Cross-component sharing controls and efficiency metrics
-remain subsequent work.
+quality or GPU-hours. Efficiency statistics can be added when needed.
