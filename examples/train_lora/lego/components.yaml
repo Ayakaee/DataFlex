@@ -1,0 +1,94 @@
+# Small-pool validation presets; production refresh intervals must be set separately.
+selectors:
+  loss:
+    params:
+      focus: medium
+      score_batch_size: 1
+  delta_loss:
+    params:
+      window_size: 0.2
+      score_batch_size: 1
+  adapt_inf:
+    params:
+      num_clusters: 2
+      cluster_grid: [2]
+      proj_dim: 8192
+      parameter_pattern: '\.layers\.16\..*lora_'
+      projection_seed: 0
+      histogram_bins: 50
+      seed: 42
+mixers:
+  static:
+    params:
+      proportions: [0.5, 0.5]  # Same order as dataset in llava15.yaml.
+  random:
+    params:
+      seed: 42
+  odm:
+    params:
+      alpha: 0.9
+      warmup_steps: 1
+      reward_scale: 15.0
+      min_exploration_rate: 0.03
+      initial_proportions: [0.5, 0.5]
+reorders:
+  lego_dynamic_saw:
+    params:
+      kind: dynamic
+      apply_at: index
+      pattern: saw
+      polarity: higher_later
+      ascending: true
+      seed: 42
+      window_size: 0
+      pattern_params:
+        num_sections: 3
+        folding_ratio: 0.075
+        layers: 2
+      score_source: model_loss
+      score_params: {}
+      reorder_every: 1
+      consume_once: true
+weighters:
+  multimodal_loss:
+    params:
+      refresh_interval: 2
+      delta: 1.0
+      score_batch_size: 1
+      score_num_workers: 0
+      loss_reduction: token
+  multimodal_deltaloss:
+    params:
+      refresh_interval: 2
+      delta: 1.0
+      score_batch_size: 1
+      score_num_workers: 0
+      loss_reduction: token
+  multimodal_adapt:
+    params:
+      refresh_interval: 2
+      anchor_batch_size: 1
+      tau: 1.0
+      pool: all
+      weight_norm: mean1
+      clip: null
+
+pipelines:
+  multimodal_lego:
+    params:
+      score_sharing: shared  # independent disables cross-component score sharing.
+      score_batch_size: 1
+      score_num_workers: 0
+      seed: 42
+      stages:
+        - family: selector
+          component: loss
+          mode: filter
+          keep_ratio: 0.75
+          every: 2
+        - family: mixer
+          component: static
+        - family: reorder
+          component: lego_dynamic_saw
+        - family: weighter
+          component: multimodal_loss

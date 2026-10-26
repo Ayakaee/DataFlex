@@ -24,6 +24,7 @@ from dataflex.utils.logging import logger
 from .context import PlanContext
 from .plan import DataPlan
 
+
 #: Index-space stages run in this order regardless of how the YAML lists them.
 #: The order is forced by the algebra, not preference: proportions should be
 #: computed over survivors, a chunk must be known before it can be arranged, and
@@ -159,11 +160,11 @@ class SelectStage(IndexStage):
     Two modes, because "selection" means different things depending on whether
     anything runs after it:
 
-    - ``filter`` keeps `keep_ratio * N` samples and leaves the interval draw to
-      a later stage. This is the coarse first stage that shrinks the pool so the
-      stages behind it have less to score.
-    - ``draw`` returns exactly `interval_size` samples, which is what a
-      standalone `dynamic_select` run does. In that case this stage is the taker.
+    - ``filter`` requests `keep_ratio * N` samples and leaves the interval draw
+      to a later stage. ADAPT-INF retains the actual author-CCS result, whose
+      size can differ after outlier filtering and cluster-budget rounding.
+    - ``draw`` returns exactly `interval_size` samples. In that case this stage
+      owns the interval budget, including when the selector is ADAPT-INF.
     """
 
     family = "selector"
@@ -223,10 +224,21 @@ class SelectStage(IndexStage):
 
         if self.name in {"loss", "delta_loss", "adapt_inf", "random"}:
             pool = set(plan.as_list())
-            if len(indices) != num or any(i not in pool for i in indices):
+            # Author CCS trims outliers and rounds per-cluster budgets, so its
+            # result need not equal the requested count. A filter passes that
+            # actual pool downstream; it does not own the training interval's
+            # exact budget. Never fill or truncate CCS to force an exact count.
+            variable_filter = self.name == "adapt_inf" and self.mode == "filter"
+            valid_count = bool(indices) if variable_filter else len(indices) == num
+            if not valid_count or any(i not in pool for i in indices):
                 raise ValueError(f"{self.name} returned invalid IDs or a different selection budget")
             if self.mode == "filter" and len(set(indices)) != len(indices):
                 raise ValueError(f"{self.name} returned duplicate IDs in filter mode")
+            if variable_filter and len(indices) != num:
+                logger.info(
+                    f"[Dataflex][Lego] adapt_inf filter requested {num}, retaining "
+                    f"{len(indices)} samples returned by author CCS"
+                )
 
         if self.mode == "filter":
             # A selector may return duplicates (several sample with replacement).
