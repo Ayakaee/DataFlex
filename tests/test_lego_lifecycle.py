@@ -225,7 +225,7 @@ def test_weight_warmup_prepare_and_eval_do_not_refresh(lego, tmp_path):
     assert component._last_refresh_step == 2
 
 
-def test_checkpoint_rejects_changed_data_and_odm_resume(lego, tmp_path):
+def test_checkpoint_rejects_changed_data_and_legacy_unsupported_state(lego, tmp_path):
     from dataflex.train.lego.checkpoint import dataset_identity, pipeline_state, restore_pipeline
 
     left, right = dataset(), dataset()
@@ -234,7 +234,7 @@ def test_checkpoint_rejects_changed_data_and_odm_resume(lego, tmp_path):
     trainer = make_trainer(lego, tmp_path)
     state = pipeline_state(trainer.pipeline)
     state["unsupported"] = ["mixer:odm"]
-    with pytest.raises(ValueError, match="ODM"):
+    with pytest.raises(ValueError, match="lacks resumable state.*mixer:odm"):
         restore_pipeline(trainer.pipeline, state, len(trainer.train_dataset))
 
 
@@ -264,7 +264,11 @@ def training_trainer(lego, directory, selector, mixer, reorder, weight):
             }
         },
         "selectors": {selector: {"params": {"cache_dir": str(directory / "selection"), "score_num_workers": 0}}},
-        "mixers": {mixer: {"params": {"proportions": [0.5, 0.5]} if mixer == "static" else {"seed": 7}}},
+        "mixers": {mixer: {"params": (
+            {"proportions": [0.5, 0.5]} if mixer == "static"
+            else {"warmup_steps": 1, "initial_proportions": [0.6, 0.4]} if mixer == "odm"
+            else {"seed": 7}
+        )}},
         "reorders": {
             reorder: {
                 "params": {
@@ -326,7 +330,39 @@ def training_trainer(lego, directory, selector, mixer, reorder, weight):
         return loss
 
     component.get_weighted_loss = record
+    trainer.mix_trace = []
+    if mixer == "odm":
+        mixer_component = trainer.pipeline.mixer_stages()[0].component
+        original_mix = mixer_component.mix
+
+        def record_mix(*args, **kwargs):
+            proportions = original_mix(*args, **kwargs)
+            trainer.mix_trace.append((kwargs["step_id"], mixer_component.state_dict()))
+            return proportions
+
+        mixer_component.mix = record_mix
     return trainer
+
+
+def assert_odm_state_equal(actual, expected):
+    assert actual.keys() == expected.keys()
+    for field in ("initial_proportions", "domain_weights", "estimated_rewards"):
+        torch.testing.assert_close(torch.as_tensor(actual[field]), torch.as_tensor(expected[field]), rtol=0, atol=0)
+    for field in ("version", "domain_names", "config", "exploration_rate", "prev_batch_info"):
+        assert actual[field] == expected[field]
+
+
+def assert_odm_resume_equal(full, partial, resumed):
+    actual = partial.mix_trace + resumed.mix_trace
+    assert [step for step, _ in actual] == [step for step, _ in full.mix_trace]
+    for (_, got), (_, expected) in zip(actual, full.mix_trace):
+        assert_odm_state_equal(got, expected)
+    original = full.pipeline.mixer_stages()[0].component
+    restored = resumed.pipeline.mixer_stages()[0].component
+    assert_odm_state_equal(restored.state_dict(), original.state_dict())
+    # Ensure the test reached adaptive updates, not just the warmup branch.
+    assert (original.estimated_rewards != 0).any()
+    assert not torch.equal(torch.as_tensor(original.domain_weights), torch.as_tensor(original.initial_proportions))
 
 
 @pytest.mark.parametrize(
@@ -335,6 +371,7 @@ def training_trainer(lego, directory, selector, mixer, reorder, weight):
         ("loss", "static", "dynamic", "multimodal_loss"),
         ("delta_loss", "random", "static", "multimodal_deltaloss"),
         ("loss", "static", "dynamic", "multimodal_adapt"),
+        ("loss", "odm", "dynamic", "multimodal_loss"),
     ],
 )
 @pytest.mark.parametrize("stop_step", [1, 2])
@@ -363,11 +400,67 @@ def test_interrupted_training_matches_continuous_run(lego, tmp_path, selector, m
     torch.testing.assert_close(torch.tensor([row[2] for row in actual]), torch.tensor([row[2] for row in full.trace]))
     torch.testing.assert_close(resumed.model.scale, full.model.scale)
     assert resumed.state.global_step == full.state.global_step == 6
+    if mixer == "odm":
+        assert_odm_resume_equal(full, partial, resumed)
     if selector == "loss" and weight == "multimodal_loss" and stop_step == 1:
         changed = training_trainer(lego, tmp_path / "changed", selector, mixer, reorder, weight)
         changed.train_dataset.dataset = changed.train_dataset.dataset.add_column("changed", [1] * 16)
         with pytest.raises(ValueError, match="dataset/config/schedule/step"):
             changed.train(resume_from_checkpoint=str(checkpoint))
+
+
+@pytest.mark.parametrize("stop_step", [3, 5])
+def test_odm_resume_after_policy_updates(lego, tmp_path, stop_step):
+    test_interrupted_training_matches_continuous_run(
+        lego, tmp_path, "loss", "odm", "dynamic", "multimodal_loss", stop_step
+    )
+
+
+def test_odm_checkpoint_roundtrip_and_validation(lego, tmp_path):
+    from dataflex.train.lego.checkpoint import pipeline_state, restore_pipeline, save_atomic
+    from dataflex.train.mixer.odm_mixer import ODMMixer
+
+    def new_mixer(names=("first", "second"), **kwargs):
+        return ODMMixer(SimpleNamespace(names=list(names)), warmup_steps=1, **kwargs)
+
+    original = new_mixer()
+    original.update_batch_info(2.0, 1)
+    original.mix(None, 4)
+    original.update_batch_info(3.5, 0)  # Must remain pending, not be applied during load.
+    path = tmp_path / "odm.pt"
+    save_atomic(path, original.state_dict())
+    saved = torch.load(path, weights_only=True)
+    restored = new_mixer()
+    restored.load_state_dict(saved)
+    assert_odm_state_equal(restored.state_dict(), original.state_dict())
+    # Loading must not retain aliases into the checkpoint buffers.
+    saved["estimated_rewards"].fill_(123)
+    assert_odm_state_equal(restored.state_dict(), original.state_dict())
+    for step, loss, domain in ((5, 1.2, 1), (8, 4.0, 0), (12, 0.5, 1)):
+        torch.testing.assert_close(torch.as_tensor(restored.mix(None, step)), torch.as_tensor(original.mix(None, step)))
+        for component in (original, restored):
+            component.update_batch_info(loss, domain)
+        assert_odm_state_equal(restored.state_dict(), original.state_dict())
+
+    for incompatible in (new_mixer(names=("second", "first")), new_mixer(alpha=0.5),
+                         new_mixer(initial_proportions=[0.2, 0.8])):
+        with pytest.raises(ValueError, match="ODM checkpoint.*differ"):
+            incompatible.load_state_dict(original.state_dict())
+    for field, value in (("domain_weights", [float("nan"), 0.5]), ("estimated_rewards", [1.0]),
+                         ("exploration_rate", -1.0), ("prev_batch_info", {"loss": 1.0, "domain_id": 2})):
+        bad = original.state_dict()
+        bad[field] = value
+        before = restored.state_dict()
+        with pytest.raises(ValueError, match="Invalid ODM checkpoint"):
+            restored.load_state_dict(bad)
+        assert_odm_state_equal(restored.state_dict(), before)
+
+    trainer = training_trainer(lego, tmp_path / "missing", "loss", "odm", "dynamic", "multimodal_loss")
+    state = pipeline_state(trainer.pipeline)
+    assert state["unsupported"] == []
+    state["stages"][1]["component"] = None
+    with pytest.raises(ValueError, match="missing ODM state"):
+        restore_pipeline(trainer.pipeline, state, len(trainer.train_dataset))
 
 
 def test_accumulation_scaling_for_models_accepting_loss_kwargs(lego, tmp_path):

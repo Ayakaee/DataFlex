@@ -83,7 +83,7 @@ def unsupported_stages(pipeline):
 
     supported = {
         "selector": {"loss", "delta_loss", "adapt_inf", "random"},
-        "mixer": {"static", "random"},
+        "mixer": {"static", "random", "odm"},
         "weighter": {"loss", "multimodal_loss", "multimodal_deltaloss", "multimodal_adapt"},
         "reorder": {"static", "dynamic"},
     }
@@ -137,12 +137,19 @@ def pipeline_state(pipeline):
 def restore_pipeline(pipeline, state, dataset_size):
     if state.get("version") != 1:
         raise ValueError("Unsupported LEGO checkpoint schema")
-    unsupported = unsupported_stages(pipeline) or state.get("unsupported")
+    unsupported = unsupported_stages(pipeline)
     if unsupported:
-        raise ValueError(f"LEGO resume is not implemented for {unsupported}; ODM state is deliberately excluded")
+        raise ValueError(f"LEGO resume is not implemented for {unsupported}")
+    if state.get("unsupported"):
+        raise ValueError(
+            f"LEGO checkpoint lacks resumable state for {state['unsupported']}; a new checkpoint is required"
+        )
     stages = [*pipeline.index_stages, *pipeline.loss_stages]
     if len(state["stages"]) != len(stages) or len(state["stage_out"]) != len(pipeline.index_stages):
         raise ValueError("LEGO checkpoint stage count differs")
+    for stage, saved in zip(stages, state["stages"]):
+        if stage.family == "mixer" and stage.name == "odm" and saved["component"] is None:
+            raise ValueError("LEGO checkpoint is missing ODM state; a new checkpoint is required")
 
     def indices(value):
         if value is None:

@@ -77,6 +77,7 @@ active sample sequence/batch cursor and `dataflex_lego_rank_<rank>.pt` for:
 - pipeline plans, stage outputs and scheduling clocks;
 - DeltaLoss selector's initial baseline;
 - weight tables, ADAPT anchors and refresh clocks;
+- ODM domain weights, estimated rewards, exploration rate and pending batch feedback;
 - reorder pending queues/cursors and ScoreBoard values/timestamps.
 
 Tensor/primitive-only state is loaded with `weights_only=True`. Resume verifies
@@ -85,15 +86,22 @@ batch/worker settings and checkpoint step. External media identity includes
 path, size and modification time; media and external score sources must remain
 immutable snapshots. Old checkpoints lacking LEGO state are rejected.
 
-Resume covers selectors loss/delta_loss/adapt_inf/random, mixers static/random,
+Resume covers selectors loss/delta_loss/adapt_inf/random, mixers static/random/odm,
 the existing static/dynamic reorder implementations (including named pattern
 presets), and the three multimodal weighters plus legacy loss. ODM algorithms
-and feedback are unchanged; checkpoints containing ODM are explicitly rejected
-on resume because its internal state is outside this change.
+and feedback attribution are unchanged: a mixed batch's loss still goes to its
+first domain ID. Resume restores each rank's pending feedback without applying
+it early or resetting the policy. Domain order, initial proportions and ODM
+hyperparameters are validated. Older checkpoints marked `mixer:odm` unsupported,
+or missing ODM component state, cannot be resumed; create a new checkpoint with
+this version.
 
 Tests cover ID alignment, refresh guards, scalar loss/gradient behavior,
 standalone weighting, gradient accumulation, warmup/evaluation, and continuous
 versus interrupted training at both interval boundaries and mid-interval. The
+ODM cases cover warmup and already-updated policies, compare subsequent mixture
+probabilities/rewards/pending feedback as well as samples/loss/model parameters,
+and include a two-rank resume check in the DDP script. The
 Adapt-inf test covers the LEGO adapter boundary; its gradient projection and
 image-IG algorithm are not reimplemented or fully exercised by these fixtures.
 

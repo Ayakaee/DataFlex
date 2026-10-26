@@ -7,16 +7,19 @@ from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
-from test_lego_lifecycle import VisionModel, dataset, training_trainer, weighter
+from test_lego_lifecycle import VisionModel, assert_odm_resume_equal, dataset, training_trainer, weighter
 from transformers import TrainerCallback
 
 from dataflex.train.lego import PlanContext
 from dataflex.train.trainer.lego_trainer import LegoTrainer
 
 
-class StopAtOne(TrainerCallback):
+class StopAtStep(TrainerCallback):
+    def __init__(self, step):
+        self.step = step
+
     def on_step_end(self, args, state, control, **kwargs):
-        if state.global_step == 1:
+        if state.global_step == self.step:
             control.should_training_stop = True
             control.should_save = True
         return control
@@ -26,15 +29,17 @@ def main(root):
     dist.init_process_group("gloo")
     rank = dist.get_rank()
     lego = SimpleNamespace(Trainer=LegoTrainer)
-    for name in ("loss", "delta", "adapt"):
-        weight = {"loss": "multimodal_loss", "delta": "multimodal_deltaloss", "adapt": "multimodal_adapt"}[name]
+    for name in ("loss", "delta", "adapt", "odm"):
+        weight_name = "loss" if name == "odm" else name
+        weight = {"loss": "multimodal_loss", "delta": "multimodal_deltaloss", "adapt": "multimodal_adapt"}[weight_name]
 
         def trainer(folder):
-            return training_trainer(lego, root / name / folder, "loss", "static", "dynamic", weight)
+            mixer = "odm" if name == "odm" else "static"
+            return training_trainer(lego, root / name / folder, "loss", mixer, "dynamic", weight)
 
         full = trainer("full")
         # Odd scoring pool exercises Accelerate's replicated tail rows.
-        component = weighter(name, full, dataset(7))
+        component = weighter(weight_name, full, dataset(7))
         component.prepare(PlanContext.from_trainer(full), VisionModel())
         table = component.anchor_emb if name == "adapt" else component.W
         tables = [torch.empty_like(table) for _ in range(dist.get_world_size())]
@@ -43,10 +48,11 @@ def main(root):
             torch.testing.assert_close(table, other)
         full.train()
         partial = trainer("partial")
-        partial.add_callback(StopAtOne())
+        stop_step = 3 if name == "odm" else 1
+        partial.add_callback(StopAtStep(stop_step))
         partial.train()
         dist.barrier()
-        checkpoint = root / name / "partial/checkpoint-1"
+        checkpoint = root / name / f"partial/checkpoint-{stop_step}"
         assert (checkpoint / f"dataflex_lego_rank_{rank}.pt").exists()
         resumed = trainer("resumed")
         # Accelerate may report cpu:0/cpu:1; PyTorch 2.6's storage loader only
@@ -67,6 +73,8 @@ def main(root):
         ]
         torch.testing.assert_close(torch.tensor([x[2] for x in actual]), torch.tensor([x[2] for x in full.trace]))
         torch.testing.assert_close(resumed.model.scale, full.model.scale)
+        if name == "odm":
+            assert_odm_resume_equal(full, partial, resumed)
         dist.barrier()
         if rank == 0:
             print(f"PASS: {name}, two-rank refresh and mid-interval resume", flush=True)
