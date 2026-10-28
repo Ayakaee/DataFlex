@@ -1,4 +1,3 @@
-from dataflex.train.data.metadata import split_batch
 from dataflex.core.registry import register_selector
 from dataflex.utils.selector_io import load_cached_selection, save_selection
 from .base_selector import Selector
@@ -190,7 +189,7 @@ class NICESelector(Selector):
             # Use safe_get_full_grad to gather the full gradient after backward.
             # See: https://github.com/deepspeedai/DeepSpeed/issues/3310
             from deepspeed.utils import safe_get_full_grad
-            loss = model(**split_batch(batch)[0]).loss
+            loss = model(**batch).loss
             self.accelerator.backward(loss)
 
             grad_list = []
@@ -202,7 +201,7 @@ class NICESelector(Selector):
             vectorized_grads = torch.cat(grad_list)
         else:
             with self.accelerator.no_sync(model):
-                loss = model(**split_batch(batch)[0]).loss
+                loss = model(**batch).loss
                 self.accelerator.backward(loss)
 
             vectorized_grads = torch.cat(
@@ -353,7 +352,7 @@ class NICESelector(Selector):
         )
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
         with torch.no_grad():
-            logits = model(**split_batch(inputs)[0]).logits
+            logits = model(**inputs).logits
         if logits.ndim == 1:
             score = torch.sigmoid(logits).mean().item()
         elif logits.shape[-1] == 1:

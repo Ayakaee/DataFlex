@@ -1,4 +1,5 @@
-# Small-pool validation presets; production refresh intervals must be set separately.
+# Multimodal LEGO components. Set domain proportions and schedules for your run.
+# Use train_type: dynamic_lego and component_name: multimodal_lego.
 selectors:
   loss:
     params:
@@ -10,24 +11,24 @@ selectors:
       score_batch_size: 1
   adapt_inf:
     params:
-      num_clusters: 2
-      cluster_grid: [2]
+      num_clusters: 10
+      cluster_grid: [5, 10, 15, 20, 25, 30, 35, 40, 45, 50]
       proj_dim: 8192
-      parameter_pattern: '\.layers\.16\..*lora_'
+      parameter_pattern: '\.layers\.16\..*lora_'  # Scoring gradients: layer index 16 LoRA parameters.
       projection_seed: 0
       histogram_bins: 50
       seed: 42
 mixers:
   static:
     params:
-      proportions: [0.5, 0.5]  # Same order as dataset in llava15.yaml.
+      proportions: [0.5, 0.5]  # Example for two domains, in training dataset order.
   random:
     params:
       seed: 42
   odm:
     params:
       alpha: 0.9
-      warmup_steps: 1
+      warmup_steps: 2000  # Set for your training budget; ODM feedback semantics are unchanged.
       reward_scale: 15.0
       min_exploration_rate: 0.03
       initial_proportions: [0.5, 0.5]
@@ -52,21 +53,21 @@ reorders:
 weighters:
   multimodal_loss:
     params:
-      refresh_interval: 2
+      refresh_interval: 244
       delta: 1.0
       score_batch_size: 1
       score_num_workers: 0
       loss_reduction: token
   multimodal_deltaloss:
     params:
-      refresh_interval: 2
+      refresh_interval: 244
       delta: 1.0
       score_batch_size: 1
       score_num_workers: 0
       loss_reduction: token
   multimodal_adapt:
     params:
-      refresh_interval: 2
+      refresh_interval: 50
       anchor_batch_size: 1
       tau: 1.0
       pool: all
@@ -84,8 +85,8 @@ pipelines:
         - family: selector
           component: loss
           mode: filter
-          keep_ratio: 0.75
-          every: 2
+          keep_ratio: 0.5
+          every: 244
         - family: mixer
           component: static
         - family: reorder

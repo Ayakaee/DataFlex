@@ -210,10 +210,9 @@ class SelectStage(IndexStage):
             num = max(1, int(len(plan) * self.keep_ratio))
 
         kwargs = ctx.as_component_kwargs()
-        if self.name == "adapt_inf" and ctx.scoreboard is not None:
-            kwargs["publish_loss"] = ctx.scoreboard.adapt_inf_publisher(
-                ctx.model, ctx.step_id, consumer=getattr(self, "score_consumer", "selector:adapt_inf")
-            )
+        # Components see the original row space, without LEGO's attached IDs.
+        kwargs["dataset"] = getattr(self.component, "dataset", ctx.dataset)
+        kwargs["data_collator"] = getattr(self.component, "data_collator", ctx.data_collator)
         indices = self.component.select(
             model=ctx.model,
             step_id=ctx.step_id,

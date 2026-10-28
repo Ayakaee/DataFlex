@@ -28,7 +28,7 @@ from dataflex.train.data.metadata import split_batch
 from dataflex.utils.logging import logger
 from dataflex.utils.loss_utils import per_sample_loss_from_outputs
 from dataflex.utils.multimodal_scoring import move_to_device, scoring_state
-from dataflex.utils.vision_ablation import strip_vision_tokens, vision_token_ids
+from dataflex.utils.multimodal_scoring import strip_vision_tokens, vision_token_ids
 
 
 @contextmanager
@@ -153,31 +153,6 @@ class ScoreBoard:
             return [values[i] for i in missing]
 
         return self.get(key, positions, step_id, compute, max_age=0, fill="nan", cache_invalid=True)
-
-    def adapt_inf_publisher(self, model, step_id, *, consumer):
-        """Only publish compatible single-example, ordinary eval-mode scores.
-
-        LLaVA's ADAPT-INF checkpointing enables selected training-mode layers;
-        batch sizes other than one also use a different scoring execution path.
-        Neither is silently treated as interchangeable with the shared scorer.
-        """
-        core = self.accelerator.unwrap_model(model) if self.accelerator is not None else model
-        if (self.score_sharing != "shared" or self.batch_size != 1
-                or getattr(getattr(core, "config", None), "model_type", None) == "llava"):
-            return None
-
-        def publish(positions, values):
-            self._bind_model(model)
-            key = self._loss_key("loss_full", consumer)
-            values = np.asarray(values, dtype=np.float64)
-            if values.shape != (len(positions),) or not np.isfinite(values).all():
-                raise ValueError("Invalid ADAPT-INF loss publication")
-            # An earlier compatible scorer may already own some entries.
-            stamps = self._scored_at.get(key)
-            missing = np.ones(len(positions), dtype=bool) if stamps is None else stamps[positions] != step_id
-            self.put(key, np.asarray(positions)[missing], values[missing], step_id)
-
-        return publish
 
     def state_dict(self):
         return {

@@ -12,7 +12,7 @@ from dataflex.train.hooks import group_by_length_requested
 from dataflex.train.lego import PlanContext, SchedulePipeline, ScoreBoard
 from dataflex.train.lego.checkpoint import dataset_identity, pipeline_state, restore_pipeline, save_atomic
 from dataflex.train.lego.domain_view import DomainView
-from dataflex.train.weighter.lifecycle import scoring_mode
+from dataflex.train.weighter.base_weighter import scoring_mode
 from dataflex.utils.load_component import load_component
 from dataflex.utils.logging import logger
 from dataflex.utils.multimodal_selection import fingerprint

@@ -7,6 +7,7 @@ import numpy as np
 import torch
 
 from dataflex.core.registry import REGISTRY
+from dataflex.train.data.metadata import DomainLabeledDataset
 from dataflex.utils.load_component import load_component
 from dataflex.utils.logging import logger
 
@@ -154,6 +155,16 @@ class SchedulePipeline:
     @staticmethod
     def _build_component(family: str, name: str, params: Dict[str, Any], runtime: Dict[str, Any]):
         """Instantiate a component the same way its dedicated trainer would."""
+        if family == "selector":
+            # The wrapper adds global IDs for training/weight lookup. Selectors
+            # already return positions, so give them the same rows without those
+            # extra fields. No subset or reindexing: candidate positions remain
+            # global. Their own IndexedDataset/collator bookkeeping stays intact.
+            runtime = dict(runtime)
+            dataset = runtime.get("dataset")
+            if isinstance(dataset, DomainLabeledDataset):
+                runtime["dataset"] = dataset.dataset
+
         if family == "reorder":
             from dataflex.train.reorder import resolve_reorder_kind
 
@@ -238,6 +249,9 @@ class SchedulePipeline:
 
     def set_data_collator(self, data_collator) -> None:
         """Use the Trainer's resolved collator for every scoring path as well."""
+        # MetadataCollator only restores fields present in its input rows.
+        # Selector rows have no LEGO IDs; indices added by selectors themselves
+        # are still preserved for their existing scoring/gather logic.
         if self.scoreboard is not None:
             self.scoreboard.data_collator = data_collator
         for stage in (*self.index_stages, *self.loss_stages):

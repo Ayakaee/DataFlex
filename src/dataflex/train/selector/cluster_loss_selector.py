@@ -14,7 +14,6 @@ from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from dataflex.core.registry import register_selector
-from dataflex.train.data.metadata import split_batch
 from dataflex.utils.logging import logger
 from dataflex.utils.selector_io import load_cached_selection, save_selection
 
@@ -160,7 +159,7 @@ class ClusterLossSelector(ClusterBaseSelector):
             for batch in loader:
                 batch = _move_to_device(batch, device)
                 labels = batch.pop("labels", None)
-                logits = model(**split_batch(batch)[0]).logits
+                logits = model(**batch).logits
                 if labels is None:
                     offset += logits.size(0)
                     continue

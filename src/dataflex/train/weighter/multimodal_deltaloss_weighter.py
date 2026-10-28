@@ -24,9 +24,8 @@ from torch.utils.data import DataLoader, Dataset
 from dataflex.train.data.metadata import split_batch
 from dataflex.core.registry import register_weighter
 from dataflex.utils.logging import logger
-from dataflex.utils.vision_ablation import strip_vision_tokens, vision_token_ids
-from .base_weighter import Weighter
-from .lifecycle import IndexedWeightLifecycle
+from dataflex.utils.multimodal_scoring import strip_vision_tokens, vision_token_ids
+from .base_weighter import IndexedWeightLifecycle, Weighter
 
 IGNORE_INDEX = -100
 

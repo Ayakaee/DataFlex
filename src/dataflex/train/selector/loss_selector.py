@@ -1,4 +1,3 @@
-from dataflex.train.data.metadata import split_batch
 from dataflex.core.registry import register_selector
 from dataflex.utils.selector_io import load_cached_selection, save_selection
 from dataflex.utils.logging import logger
@@ -97,7 +96,7 @@ class LossSelector(Selector):
             idx = idx.view(-1).to(dtype=torch.long)
 
             with torch.no_grad():
-                model_inputs, _ = split_batch(batch)
+                model_inputs = {k: v for k, v in batch.items() if k not in ("idx", "domain_id")}
                 outputs = model(**model_inputs)
                 loss = per_sample_loss_from_outputs(outputs, model_inputs).view(-1)
 
@@ -133,7 +132,7 @@ class LossSelector(Selector):
         model.eval()
         os.makedirs(self.cache_dir, exist_ok=True)
         save_path = os.path.join(self.cache_dir, f"step_{step_id}.json")
-        if getattr(self, "reuse_selection_cache", True) and os.path.exists(save_path):
+        if os.path.exists(save_path):
             if self.accelerator.is_main_process:
                 cached_indices, _ = load_cached_selection(save_path)
             else:
