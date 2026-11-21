@@ -212,6 +212,14 @@ class SelectStage(IndexStage):
         else:
             num = max(1, int(len(plan) * self.keep_ratio))
 
+        if self.name == "dynamic_presel" and ctx.step_id == self.component.diagnostic_step:
+            self.component.diagnose(ctx.model, ctx.step_id, num)
+            if self.mode == "filter":
+                return plan
+            rng = np.random.default_rng(ctx.step_id + 4242)
+            indices = rng.choice(plan.indices, size=num, replace=False)
+            return plan.replace_indices(indices, stage="presel:diagnostic_uniform")
+
         kwargs = ctx.as_component_kwargs()
         # Components see the original row space, without LEGO's attached IDs.
         kwargs["dataset"] = getattr(self.component, "dataset", ctx.dataset)

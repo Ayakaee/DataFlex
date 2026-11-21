@@ -158,6 +158,10 @@ class LegoTrainer(SelectTrainer):
             save_plans=bool(cfg.get("save_plans", False)),
             cache_dir=cfg.get("cache_dir") or str(Path(self.args.output_dir) / "lego_cache"),
         )
+        self._trained_index_observers = [
+            stage.component.observe_trained for stage in self.pipeline.index_stages
+            if callable(getattr(stage.component, "observe_trained", None))
+        ]
         if any(stage.family == "reorder" and not stage.takes_budget for stage in self.pipeline.index_stages):
             # The budget policy changes the planned samples under the same YAML.
             self._lego_config["budget_before_reorder"] = True
@@ -361,6 +365,8 @@ class LegoTrainer(SelectTrainer):
             self.model_accepts_loss_kwargs = accepts_loss_kwargs
             self.compute_loss_func = compute_loss_func
 
+        for observer in self._trained_index_observers:
+            observer(inputs["idx"])
         self._update_reweighting_mixers(model, inputs)
 
         # ODM attributes its bandit reward per batch. MixTrainer does this inside
@@ -457,6 +463,10 @@ class LegoTrainer(SelectTrainer):
             self._last_signals = state["signals"]
             self._lego_restored_step = state["global_step"]
         result = super().train(*args, **kwargs)
+        for stage in self.pipeline.index_stages:
+            finish = getattr(stage.component, "finish_training", None)
+            if callable(finish):
+                finish()
         try:
             self.pipeline.on_train_end(self.args.output_dir)
         except Exception as exc:

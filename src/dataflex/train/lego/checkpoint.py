@@ -82,7 +82,7 @@ def unsupported_stages(pipeline):
     from dataflex.train.reorder.static_reorder import StaticReorder
 
     supported = {
-        "selector": {"loss", "delta_loss", "adapt_inf", "random"},
+        "selector": {"loss", "delta_loss", "adapt_inf", "dynamic_presel", "random"},
         "mixer": {"static", "random", "odm"},
         "weighter": {"loss", "multimodal_loss", "multimodal_deltaloss", "multimodal_adapt"},
         "reorder": {"static", "dynamic"},
