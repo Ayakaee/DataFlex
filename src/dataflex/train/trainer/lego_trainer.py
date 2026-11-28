@@ -83,6 +83,7 @@ class LegoTrainer(SelectTrainer):
     def __init__(self, finetuning_args, processor=None, gen_kwargs=None, model_args=None, **kwargs):
         # Extra keys `lego_get_dataset` attached to the dataset module arrive
         # here because run_pt/run_sft splat it into the constructor.
+        verify_presel_rows = kwargs.pop("verify_presel_rows", None)
         domain_ids = kwargs.pop("domain_ids", None)
         domain_names = kwargs.pop("domain_names", None)
 
@@ -148,6 +149,7 @@ class LegoTrainer(SelectTrainer):
             data_collator=self.data_collator,
             output_dir=self.args.output_dir,
             mixture_manager=self.domain_view,
+            verify_presel_rows=verify_presel_rows,
         )
 
         self.pipeline = SchedulePipeline.from_config(

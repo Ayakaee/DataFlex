@@ -618,6 +618,7 @@ def lego_get_dataset(
 
     signature = _snapshot_signature(model_args, data_args, stage)
 
+    per_source_raw = None
     if _snapshot_ready(data_args.tokenized_path):
         # Same on-disk format the mixture path writes: domains kept separate and
         # ordered by the manifest. Lego concatenates them below, so a snapshot is
@@ -688,6 +689,38 @@ def lego_get_dataset(
     dataset_module["train_dataset"] = DomainLabeledDataset(dataset_module["train_dataset"], domain_ids)
     logger.info_rank0("[Dataflex][Lego] train_dataset wrapped to carry idx and domain_id per sample.")
 
+    def verify_presel_rows(dataset, manifest):
+        # Only dynamic PreSel needs raw record identity. Unpacked SFT emits at
+        # most one processed row per raw row, in input order.
+        from dataflex.offline_selector.prepare_dynamic_presel import verify_source_rows
+
+        if stage != "sft" or data_args.packing or dataset is not train_dataset:
+            raise ValueError("PreSel requires the original concatenated, unpacked SFT dataset")
+        if domain_names != manifest.get("domains"):
+            raise ValueError("PreSel cache domain order differs from the training dataset")
+        raw = per_source_raw
+        if raw is None:
+            raw = _get_merged_dataset(
+                data_args.dataset, model_args, data_args, training_args, stage, return_dict=True
+            )
+        for name in domain_names:
+            aligned, processed = raw[name], per_source_pp[name]
+            if len(aligned) != len(processed):
+                raise ValueError(f"PreSel cannot map dropped or expanded training rows in {name}")
+            verify_source_rows(aligned, data_args.media_dir or data_args.dataset_dir, name, manifest)
+            if per_source_raw is None:
+                # A pre-tokenized snapshot can be reordered independently of
+                # the source files. Compare its logical rows (including order).
+                expected = _get_preprocessed_dataset(
+                    aligned, data_args, training_args, stage, template, tokenizer, processor, is_eval=False
+                ).with_format("arrow")
+                actual = processed.with_format("arrow")
+                if len(expected) != len(actual) or any(
+                    not expected[i:i + 512].equals(actual[i:i + 512]) for i in range(0, len(actual), 512)
+                ):
+                    raise ValueError(f"PreSel tokenized snapshot differs from the source rows in {name}")
+
+    dataset_module["verify_presel_rows"] = verify_presel_rows
     dataset_module["domain_ids"] = domain_ids
     dataset_module["domain_names"] = domain_names
     return dataset_module

@@ -22,6 +22,24 @@ def row_digest(row):
     return hashlib.sha256(value.encode()).digest()
 
 
+def verify_source_rows(aligned, media_dir, domain, manifest):
+    """Compare the actual aligned records to the cache's ordered source digest."""
+    source = hashlib.sha256()
+    roles = {"user": "human", "assistant": "gpt"}
+    for row in aligned:
+        images = row["_images"]
+        if len(images or []) != 1:
+            raise ValueError(f"PreSel expects one image per training record in {domain}")
+        image = Path(images[0])
+        if image.is_relative_to(media_dir):
+            image = image.relative_to(media_dir)
+        turns = [{"from": roles.get(m["role"], m["role"]), "value": m["content"]}
+                 for m in (*row["_prompt"], *row["_response"])]
+        source.update(row_digest({"image": image.as_posix(), "conversations": turns}))
+    if source.hexdigest() != manifest["source_rows"][domain]:
+        raise ValueError(f"PreSel cache does not match the ordered training records in {domain}")
+
+
 def task_records(prepared, domains, split_zip, limit):
     images, original, records, sources = [], {}, [], {}
     for domain in domains:

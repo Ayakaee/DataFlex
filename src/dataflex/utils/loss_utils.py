@@ -64,3 +64,18 @@ def per_sample_loss_from_outputs(outputs, inputs: Dict[str, Any]) -> torch.Tenso
         batch = next(iter(inputs.values())).size(0)
         return loss.detach().view(1).expand(batch).clone()
     return per_sample_loss_from_logits(logits, labels)
+
+
+def selection_scoring_loss(outputs, inputs):
+    """NaN denotes missing supervision; inf carries a model error through rank gathering."""
+    loss = per_sample_loss_from_outputs(outputs, inputs).view(-1)
+    labels = inputs.get("labels")
+    supervised = (labels[..., 1:].ne(IGNORE_INDEX).any(-1) if labels is not None
+                  else torch.ones_like(loss, dtype=torch.bool))
+    return loss.masked_fill(~supervised, UNSCORED).masked_fill(supervised & ~torch.isfinite(loss), float("inf"))
+
+
+def check_gathered_scoring_loss(losses, indices, step_id):
+    invalid = indices[torch.isinf(losses)]
+    if invalid.numel():
+        raise ValueError(f"Non-finite supervised loss at step {step_id}, sample ID {int(invalid[0])}")
