@@ -1,5 +1,6 @@
 # Multimodal LEGO components. Set domain proportions and schedules for your run.
 # Use train_type: dynamic_lego and component_name: multimodal_lego.
+# Set warmup_step: 22, update_step: 142, update_times: 5 and max_steps: 732 in the training config.
 selectors:
   loss:
     params:
@@ -29,7 +30,7 @@ mixers:
   odm:
     params:
       alpha: 0.9
-      warmup_steps: 2000  # Set for your training budget; ODM feedback semantics are unchanged.
+      warmup_steps: 22
       reward_scale: 15.0
       min_exploration_rate: 0.03
       initial_proportions: [0.5, 0.5]
@@ -48,17 +49,18 @@ reorders:
       consume_once: true
       seed: 42
       window_size: 0
+# In LEGO, multimodal_loss counts its refresh interval from the weighter stage warmup_step.
 weighters:
   multimodal_loss:
     params:
-      refresh_interval: 244
+      refresh_interval: 142
       delta: 1.0
       score_batch_size: 1
       score_num_workers: 0
       loss_reduction: token
   multimodal_deltaloss:
     params:
-      refresh_interval: 244
+      refresh_interval: 142
       delta: 1.0
       score_batch_size: 1
       score_num_workers: 0
@@ -84,11 +86,16 @@ pipelines:
           component: loss
           mode: filter
           keep_ratio: 0.5
-          every: 244
+          warmup_step: 22
+          every: 142
         - family: mixer
           component: static
+          warmup_step: 22
+          every: 142
         - family: reorder
           component: lego_selector_folding
-          every: 244
+          warmup_step: 22
+          every: 142
         - family: weighter
           component: multimodal_loss
+          warmup_step: 22

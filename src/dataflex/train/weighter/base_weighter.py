@@ -202,6 +202,8 @@ def scoring_mode(model):
 class IndexedWeightLifecycle:
     """Periodic full-dataset refresh, followed by lookup in processed-row space."""
 
+    refresh_origin_step = 0
+
     def set_score_source(self, source):
         """LEGO supplies raw scores; standalone weighters retain their scorer."""
         self._score_source = source
@@ -220,7 +222,8 @@ class IndexedWeightLifecycle:
         if self.refresh_interval <= 0:
             raise ValueError("refresh_interval must be positive")
         step = ctx.step_id
-        if self.W is None or (step != self._last_refresh_step and step % self.refresh_interval == 0):
+        due = (step - self.refresh_origin_step) % self.refresh_interval == 0
+        if self.W is None or (step != self._last_refresh_step and due):
             if not len(self.dataset):
                 raise ValueError("Cannot refresh weights on an empty training dataset")
             self._uses_sample_ids = "idx" in self.dataset[0]

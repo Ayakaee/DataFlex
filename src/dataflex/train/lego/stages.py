@@ -653,6 +653,9 @@ class WeightStage(LossStage):
         super().__init__(component, name, **kwargs)
         if self.every != 1:
             raise ValueError("Weight stages apply every batch; configure refresh_interval on the weighter")
+        if name == "multimodal_loss":
+            # Align full-pool loss refreshes with selection from the stage's first active step.
+            component.refresh_origin_step = self.warmup_step
 
     def weights(self, losses: torch.Tensor, ctx: PlanContext, model=None, inputs=None) -> Optional[torch.Tensor]:
         fn = getattr(self.component, "get_sample_weights", None)
