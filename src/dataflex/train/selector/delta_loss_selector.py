@@ -1,7 +1,5 @@
 import torch
-import math
 import os
-import json
 import numpy as np
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
@@ -10,7 +8,7 @@ from dataflex.train.data.loader import split_batch
 from dataflex.core.registry import register_selector
 from .base_selector import Selector
 from dataflex.utils.logging import logger
-from dataflex.utils.loss_utils import UNSCORED, per_sample_loss_from_outputs
+from dataflex.utils.loss_utils import UNSCORED, check_gathered_scoring_loss, selection_scoring_loss
 from dataflex.utils.selector_io import load_cached_selection, save_selection
 
 def sigmoid(x, k):
@@ -102,7 +100,7 @@ class DeltaLossSelector(Selector):
             with torch.no_grad():
                 model_inputs, _ = split_batch(batch)
                 outputs = model(**model_inputs)
-                loss = per_sample_loss_from_outputs(outputs, model_inputs).view(-1)
+                loss = selection_scoring_loss(outputs, model_inputs)
 
             local_losses.append(loss.float())
             local_indices.append(idx)
@@ -114,19 +112,14 @@ class DeltaLossSelector(Selector):
             local_losses = torch.zeros(0, device=self.accelerator.device)
             local_indices = torch.zeros(0, dtype=torch.long, device=self.accelerator.device)
 
-        all_losses = self.accelerator.gather(local_losses).detach().cpu().tolist()
-        all_indices = self.accelerator.gather(local_indices).detach().cpu().tolist()
-
-        # gather pads the last batch, so the same idx can come back more than
-        # once; keeping the first occurrence makes the result independent of the
-        # world size. Non-finite values are left out so that a duplicate
-        # carrying a real number can still fill the index in, and anything still
-        # missing afterwards reads as UNSCORED.
+        all_losses = self.accelerator.gather(local_losses)
+        all_indices = self.accelerator.gather(local_indices)
+        check_gathered_scoring_loss(all_losses, all_indices, step_id)
         by_index = {}
-        for value, i in zip(all_losses, all_indices):
-            i = int(i)
-            if i not in by_index and math.isfinite(value):
-                by_index[i] = float(value)
+        for i, loss in zip(all_indices.cpu().tolist(), all_losses.cpu().tolist()):
+            by_index.setdefault(i, loss)
+        if any(i not in by_index for i in positions):
+            raise RuntimeError("DeltaLoss scoring did not return every requested sample ID")
 
         if self.accelerator.is_main_process:
             logger.info(f"[Dataflex] Loss calculation finished")
@@ -165,101 +158,61 @@ class DeltaLossSelector(Selector):
         save_path = os.path.join(self.cache_dir, f"step_{step_id}.json")
 
         positions = self.candidate_positions()
-        n = len(positions)
-
-        # ========= First call to select, calculate and save initial_losses =========
-        if self.first_time == True:
-            self.first_time = False
-            self.path_to_initial_losses = save_path
-            # Read and broadcast in main
-            if self._score_sink is None and getattr(self, "reuse_selection_cache", True) and os.path.exists(save_path):
-                if self.accelerator.is_main_process:
-                    cached_indices, metrics = load_cached_selection(save_path)
-                    self._initial_losses = np.asarray(metrics["loss"], dtype=np.float64)
-                else:
-                    cached_indices = None
-                cached_indices_list = [cached_indices]
-                if dist.is_available() and dist.is_initialized():
-                    dist.broadcast_object_list(cached_indices_list, src=0)
-                    cached_indices = cached_indices_list[0]
-                else:
-                    cached_indices = cached_indices or []
-                return cached_indices
-
-            logger.info(f"[Dataflex] Calculating initial losses...")
-            scores = self._scores_for(positions, model, step_id)
-            self._initial_losses = self._dense_baseline(positions, scores)
-
-            if self.accelerator.is_main_process:
-                logger.info(f"[Dataflex] Got initial_losses. Return random warmup selection.")
-                gen = torch.Generator()
-                gen.manual_seed(self.seed)
-                if num_samples > n:
-                    raise ValueError(
-                        f"Cannot sample {num_samples} without replacement from {n} samples"
-                    )
-                picked = torch.randperm(n, generator=gen)[:num_samples].tolist()
-                sel = [positions[i] for i in picked]
-                metric_payload = {"loss": self._dense_baseline(positions, scores).tolist()}
-                # The baseline call selects randomly; no delta exists yet.
-                self.publish_scores(sel, [scores[i] for i in picked], step_id,
-                                    metric="loss", ascending=True, reason="delta_baseline")
-                # Only save in main
-                save_selection(save_path, sel, metric_payload, self.accelerator)
-
-            else:
-                sel = None
-
-            obj = [sel]
+        first = self.first_time
+        # Older selection files did not record exclusions and may contain
+        # unsupervised samples. Recompute those files under the current policy.
+        if self._score_sink is None and getattr(self, "reuse_selection_cache", True):
+            cached = None
+            if self.accelerator.is_main_process and os.path.exists(save_path):
+                indices, metrics = load_cached_selection(save_path)
+                if "excluded_ids" in metrics:
+                    cached = (indices, metrics["loss"] if first else None)
             if dist.is_available() and dist.is_initialized():
-                dist.broadcast_object_list(obj, src=0)
-                sel = obj[0]
-            else:
-                sel = sel or []
+                packet = [cached]
+                dist.broadcast_object_list(packet, src=0)
+                cached = packet[0]
+            if cached is not None:
+                indices, losses = cached
+                if first:
+                    self._initial_losses = np.asarray(losses, dtype=np.float64)
+                    self.path_to_initial_losses = save_path
+                    self.first_time = False
+                return indices
 
-            return sel
-        
-        # ========= Subsequent call to select, select samples based on delta_loss =========
-        
-        if self._score_sink is None and getattr(self, "reuse_selection_cache", True) and os.path.exists(save_path):
-            if self.accelerator.is_main_process:
-                cached_indices, _ = load_cached_selection(save_path)
-            else:
-                cached_indices = None
-            cached_indices_list = [cached_indices]
-            if dist.is_available() and dist.is_initialized():
-                dist.broadcast_object_list(cached_indices_list, src=0)
-                cached_indices = cached_indices_list[0]
-            else:
-                cached_indices = cached_indices or []
-            return cached_indices
-
-        logger.info(f"[Dataflex] Calculating current losses...")
-        current_scores = self._scores_for(positions, model, step_id)
-
-        # ========= Delta Loss selection =========
-        if self.accelerator.is_main_process:
-            logger.info(f"[Dataflex] Loading initial losses from {self.path_to_initial_losses}")
-
+        scores = np.asarray(self._scores_for(positions, model, step_id), dtype=np.float64)
+        if first:
+            baseline = scores
+        else:
             if self._initial_losses is None:
                 _, metrics = load_cached_selection(self.path_to_initial_losses)
                 self._initial_losses = np.asarray(metrics["loss"], dtype=np.float64)
-            baseline = self._initial_losses.copy()
-            # Caches written before the sentinel was unified hold +inf for
-            # entries that were never scored, and an infinite loss is not a
-            # usable measurement either way. Normalising them here keeps both
-            # file formats on the one code path below.
-            baseline[~np.isfinite(baseline)] = UNSCORED
+            baseline = self._initial_losses[np.asarray(positions, dtype=np.int64)]
 
-            logger.info(f"[Dataflex] Selecting samples based on delta loss.")
+        valid = np.isfinite(baseline) & np.isfinite(scores)
+        eligible = np.flatnonzero(valid)
+        excluded = [positions[i] for i in np.flatnonzero(~valid)]
+        n = len(eligible)
+        logger.info(f"[DeltaLoss] step {step_id}: excluded {len(excluded)} of {len(positions)} candidates")
+        if num_samples > n:
+            raise ValueError(f"DeltaLoss step {step_id}: requested {num_samples} samples without replacement; "
+                             f"only {n} candidates have valid scores")
+        if first:
+            self._initial_losses = self._dense_baseline(positions, scores)
+            self.path_to_initial_losses = save_path
+            self.first_time = False
 
-            # Calculate delta loss, only compare on candidate pool
-            initial = torch.tensor(baseline[np.asarray(positions, dtype=np.int64)], dtype=torch.float32)
-            current = torch.tensor(current_scores, dtype=torch.float32)
+        if self.accelerator.is_main_process and first:
+            gen = torch.Generator().manual_seed(self.seed)
+            picked = eligible[torch.randperm(n, generator=gen)[:num_samples].tolist()]
+            sel = [positions[i] for i in picked]
+            self.publish_scores(sel, scores[picked].tolist(), step_id,
+                                metric="loss", ascending=True, reason="delta_baseline")
+            save_selection(save_path, sel, {"loss": self._initial_losses.tolist(), "excluded_ids": excluded},
+                           self.accelerator)
+        elif self.accelerator.is_main_process:
+            initial = torch.tensor(baseline[eligible], dtype=torch.float32)
+            current = torch.tensor(scores[eligible], dtype=torch.float32)
             delta_loss = initial - current
-            # An unknown score on either side leaves the difference unknown, and
-            # those samples sort last so the window never reaches them.
-            delta_loss = torch.nan_to_num(delta_loss, nan=float("-inf"))
 
             # Sort indices
             sorted_indices = torch.argsort(delta_loss, descending=True)
@@ -288,30 +241,20 @@ class DeltaLossSelector(Selector):
             # Normalize probability
             probs = probs / probs.sum()  # Normalize probability, make the sum to be 1
 
-            available = int((probs > 0).sum().item())
-            effective_replacement = False
-            
-            # If the effective sample size is less than the requested sample size, use replacement sampling
-            if not effective_replacement and num_samples > available:
-                effective_replacement = True
-                logger.info(
-                    f"[Dataflex] Effective sample size {available} is less than the requested number {num_samples},"
-                    f"automatically changed to replacement sampling."
-                )
-
             # Create random number generator
             gen = torch.Generator()
             gen.manual_seed(self.seed + int(step_id))
             
             # Use torch.multinomial for sampling
             picked = torch.multinomial(probs.cpu(), num_samples=num_samples,
-                                       replacement=effective_replacement, generator=gen).tolist()
+                                       replacement=False, generator=gen).tolist()
             # multinomial gives the indices in the candidate pool, map back to the dataset indices
-            sel = [positions[i] for i in picked]
+            sel = [positions[eligible[i]] for i in picked]
 
             # ========= Save (only save "selected indices + corresponding metric") =========
             metric_payload = {
-                "delta_loss": [float(delta_loss[i].item()) for i in picked]
+                "delta_loss": [float(delta_loss[i].item()) for i in picked],
+                "excluded_ids": excluded,
             }
             self.publish_scores(sel, metric_payload["delta_loss"], step_id,
                                 metric="delta_loss", ascending=False)

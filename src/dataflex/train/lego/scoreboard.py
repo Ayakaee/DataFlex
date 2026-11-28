@@ -26,7 +26,11 @@ from tqdm import tqdm
 
 from dataflex.train.data.loader import split_batch
 from dataflex.utils.logging import logger
-from dataflex.utils.loss_utils import per_sample_loss_from_outputs
+from dataflex.utils.loss_utils import (
+    check_gathered_scoring_loss,
+    per_sample_loss_from_outputs,  # also exported by dataflex.train.lego
+    selection_scoring_loss,
+)
 from dataflex.utils.multimodal_scoring import move_to_device, scoring_state
 from dataflex.utils.multimodal_scoring import strip_vision_tokens, vision_token_ids
 
@@ -161,9 +165,8 @@ class ScoreBoard:
     def put_selection_scores(self, consumer, payload):
         indices = np.asarray(payload["indices"], dtype=np.int64)
         scores = None if payload["scores"] is None else np.asarray(payload["scores"], dtype=np.float64)
-        if (indices.ndim != 1 or len(np.unique(indices)) != len(indices)
-                or (indices < 0).any() or (indices >= self.dataset_size).any()):
-            raise ValueError("Selector scores have invalid or duplicate sample IDs")
+        if indices.ndim != 1 or (indices < 0).any() or (indices >= self.dataset_size).any():
+            raise ValueError("Selector scores have invalid sample IDs")
         if scores is not None and (scores.shape != indices.shape or not np.isfinite(scores).all()):
             raise ValueError("Selector scores must be finite and aligned with sample IDs")
         if payload["step"] < 0 or payload["metric"] not in {None, "loss", "delta_loss"}:
@@ -172,10 +175,14 @@ class ScoreBoard:
             raise ValueError("Selector score direction must be explicit")
         if scores is None and (payload["metric"] is not None or payload.get("reason") != "random"):
             raise ValueError("Only Random selection can publish no scores")
-        order = np.argsort(indices)
+        # Draw plans can contain repeated positions. The scoreboard is keyed
+        # by ID, while the plan retains every occurrence in its original order.
+        unique, first, inverse = np.unique(indices, return_index=True, return_inverse=True)
+        if scores is not None and not np.array_equal(scores[first][inverse], scores):
+            raise ValueError("Conflicting selector scores for the same sample ID")
         self.selection_scores[consumer] = {
-            **payload, "indices": indices[order].copy(),
-            "scores": None if scores is None else scores[order].copy(),
+            **payload, "indices": unique,
+            "scores": None if scores is None else scores[first],
         }
 
     def selection_scores_for(self, consumer, positions, selection_step):
@@ -388,7 +395,7 @@ class ScoreBoard:
                         raise ValueError("LEGO scoring requires logits; a scalar batch loss is not a per-sample score")
                     if outputs.logits.shape[:2] != labels.shape:
                         raise ValueError("LEGO scoring requires logits aligned with response labels")
-                    per_sample = per_sample_loss_from_outputs(outputs, {"labels": labels})
+                    per_sample = selection_scoring_loss(outputs, {"labels": labels})
                 local_losses.append(per_sample)
                 local_indices.append(idx)
 
@@ -396,6 +403,7 @@ class ScoreBoard:
             indices = torch.cat(local_indices) if local_indices else torch.zeros(0, dtype=torch.long, device=device)
             if acc is not None:
                 losses, indices = acc.gather(losses), acc.gather(indices)
+            check_gathered_scoring_loss(losses, indices, step_id)
             out = {}
             for i, value in zip(indices.cpu().tolist(), losses.cpu().tolist()):
                 # Accelerate pads the tail; preserve the first occurrence,

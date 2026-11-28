@@ -49,7 +49,7 @@ def task_scores(ratios, tasks, count):
 @register_selector("dynamic_presel")
 class DynamicPreSel(Selector):
     def __init__(self, dataset, accelerator, data_collator, cache_dir, artifacts, diagnostic_step=22,
-                 cutoff_len=2048, seed=42):
+                 cutoff_len=2048, seed=42, verify_presel_rows=None):
         super().__init__(dataset, accelerator, data_collator, cache_dir)
         self.seed, self.diagnostic_step, self.cutoff_len = seed, diagnostic_step, cutoff_len
         root = Path(artifacts)
@@ -58,6 +58,9 @@ class DynamicPreSel(Selector):
         meta = json.loads(manifest_path.read_text())
         if meta["version"] != 1 or meta["rows"] != len(dataset):
             raise ValueError("PreSel cache does not match the processed dataset size")
+        if verify_presel_rows is None:
+            raise ValueError("Dynamic PreSel requires row-order verification from the LEGO data loader")
+        verify_presel_rows(dataset, meta)
         for name in ("ranks.npz", "reference.json"):
             if file_fingerprint(root / name) != meta["files"][name]:
                 raise ValueError(f"PreSel artifact changed: {name}")
